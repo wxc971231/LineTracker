@@ -1,0 +1,196 @@
+{
+  "model_version": "dataset1-binary-background-v1",
+  "raw_root": "/home/pc5090/Code/github/LineTracker/data/raw/dataset1",
+  "fit_samples": [
+    "dataset1/1",
+    "dataset1/3",
+    "dataset1/4",
+    "dataset1/6",
+    "dataset1/7",
+    "dataset1/9",
+    "dataset1/10"
+  ],
+  "excluded_samples": {
+    "dataset1/2": "byte-identical duplicate of dataset1/1",
+    "dataset1/5": "reserved for low-count/dropout stress testing",
+    "dataset1/8": "reserved for low-count/dropout stress testing"
+  },
+  "profile_width_m": 1000,
+  "expanded_fraction": 0.25,
+  "parameter_names": [
+    "level",
+    "decay",
+    "near_field"
+  ],
+  "coefficient_ranges": [
+    [
+      -0.6817278115538271,
+      0.8567738659055081
+    ],
+    [
+      -0.3770580804590976,
+      0.4113665977183184
+    ],
+    [
+      -0.6652566531628775,
+      0.8242232557509678
+    ]
+  ],
+  "fano_range": [
+    1.302964918760881,
+    1.9859607461279252
+  ],
+  "spatial_pair_range": [
+    1.4798065131430107,
+    2.3456788358587475
+  ],
+  "sample_metrics": [
+    {
+      "sample": "dataset1/1",
+      "frames": 384,
+      "mean_events_per_frame": 1559.3828125,
+      "fano_factor": 1.9121422041149638,
+      "temporal_pair_ratio_10km_plus": 1.0488495697277487,
+      "spatial_pair_ratio_10km_plus": 1.7898847957921817,
+      "low_count_runs": [],
+      "region_rates": {
+        "0–10 km": 0.07397875204187085,
+        "10–50 km": 0.008241080729166666,
+        "50–100 km": 0.0021852083333333333,
+        "100–300 km": 0.001903828125
+      },
+      "coefficients": [
+        0.4361634973157658,
+        -0.028451527818714295,
+        -0.17314116241101904
+      ],
+      "three_parameter_log_intensity_rmse": 0.09768468752963651
+    },
+    {
+      "sample": "dataset1/3",
+      "frames": 146,
+      "mean_events_per_frame": 1680.8835616438357,
+      "fano_factor": 1.54927148359368,
+      "temporal_pair_ratio_10km_plus": 1.054823882251308,
+      "spatial_pair_ratio_10km_plus": 1.5734603245986867,
+      "low_count_runs": [],
+      "region_rates": {
+        "0–10 km": 0.07314361573143616,
+        "10–50 km": 0.00921832191780822,
+        "50–100 km": 0.0024432876712328767,
+        "100–300 km": 0.0022931164383561643
+      },
+      "coefficients": [
+        0.5878186568943115,
+        -0.17273645579997238,
+        -0.516308662271493
+      ],
+      "three_parameter_log_intensity_rmse": 0.0560155516894124
+    },
+    {
+      "sample": "dataset1/4",
+      "frames": 510,
+      "mean_events_per_frame": 1686.5274509803921,
+      "fano_factor": 1.7594762188330866,
+      "temporal_pair_ratio_10km_plus": 1.086323761881981,
+      "spatial_pair_ratio_10km_plus": 2.2590916035871738,
+      "low_count_runs": [],
+      "region_rates": {
+        "0–10 km": 0.07360696853999125,
+        "10–50 km": 0.0070801470588235296,
+        "50–100 km": 0.0028544313725490196,
+        "100–300 km": 0.0026230196078431372
+      },
+      "coefficients": [
+        0.7029236981595746,
+        -0.298215612641356,
+        -0.2994595636661173
+      ],
+      "three_parameter_log_intensity_rmse": 0.15164523429160337
+    },
+    {
+      "sample": "dataset1/6",
+      "frames": 382,
+      "mean_events_per_frame": 1132.4293193717278,
+      "fano_factor": 1.9176611633912206,
+      "temporal_pair_ratio_10km_plus": 0.9924495881969055,
+      "spatial_pair_ratio_10km_plus": 1.5663937454145844,
+      "low_count_runs": [],
+      "region_rates": {
+        "0–10 km": 0.06433549114073711,
+        "10–50 km": 0.006882198952879581,
+        "50–100 km": 0.0010125130890052355,
+        "100–300 km": 0.0008161256544502618
+      },
+      "coefficients": [
+        -0.34783162841079956,
+        0.2881721662687009,
+        0.3238481424461034
+      ],
+      "three_parameter_log_intensity_rmse": 0.11036668108691423
+    },
+    {
+      "sample": "dataset1/7",
+      "frames": 448,
+      "mean_events_per_frame": 1034.5535714285713,
+      "fano_factor": 1.4984918105205074,
+      "temporal_pair_ratio_10km_plus": 1.032015025604529,
+      "spatial_pair_ratio_10km_plus": 1.797828472791997,
+      "low_count_runs": [],
+      "region_rates": {
+        "0–10 km": 0.06436067713914248,
+        "10–50 km": 0.005301953125,
+        "50–100 km": 0.000871875,
+        "100–300 km": 0.0006766964285714285
+      },
+      "coefficients": [
+        -0.5278776438078936,
+        0.33252412990057684,
+        0.6752752648595832
+      ],
+      "three_parameter_log_intensity_rmse": 0.09790335361692884
+    },
+    {
+      "sample": "dataset1/9",
+      "frames": 256,
+      "mean_events_per_frame": 1187.39453125,
+      "fano_factor": 1.3712645014975853,
+      "temporal_pair_ratio_10km_plus": 1.0497544814529964,
+      "spatial_pair_ratio_10km_plus": 1.9408186653345478,
+      "low_count_runs": [],
+      "region_rates": {
+        "0–10 km": 0.06709342809280928,
+        "10–50 km": 0.005467578125,
+        "50–100 km": 0.00135453125,
+        "100–300 km": 0.00115048828125
+      },
+      "coefficients": [
+        -0.05991846845103676,
+        0.0027363130358078885,
+        -0.11013863643644174
+      ],
+      "three_parameter_log_intensity_rmse": 0.061362311942122674
+    },
+    {
+      "sample": "dataset1/10",
+      "frames": 319,
+      "mean_events_per_frame": 1211.6426332288402,
+      "fano_factor": 1.4262753644794628,
+      "temporal_pair_ratio_10km_plus": 1.0435132378170353,
+      "spatial_pair_ratio_10km_plus": 1.8208802291524786,
+      "low_count_runs": [],
+      "region_rates": {
+        "0–10 km": 0.06750549663116782,
+        "10–50 km": 0.005528918495297805,
+        "50–100 km": 0.0014036990595611286,
+        "100–300 km": 0.0012265673981191223
+      },
+      "coefficients": [
+        -0.007298223140582939,
+        -0.023442758856098714,
+        -0.11949754114077443
+      ],
+      "three_parameter_log_intensity_rmse": 0.039673973859366864
+    }
+  ]
+}

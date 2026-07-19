@@ -216,3 +216,9 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# custom
+data/raw/dataset1
+data/raw/dataset260707
+data/synthetic/gen
+
