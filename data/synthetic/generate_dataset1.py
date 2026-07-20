@@ -1,18 +1,19 @@
 #!/usr/bin/env python3
-"""读取已拟合的 dataset1 模型，批量生成二值背景数据。
+"""读取已拟合的 dataset1 模型，批量生成含移动目标的二值时距数据。
 
 常用命令：
 
-    # 用默认的中等场景生成 10 个样本；每个样本只因随机种子不同而不同。
+    # 用中等固定背景场景生成 10 个样本；每个样本只因随机种子和目标不同而不同。
     conda run -n linetracker-py311 python data/synthetic/generate_dataset1.py \
-        --samples 10
+        --samples 10 --random-knobs false
 
     # 随机抽取五个连续旋钮，构造多样的 B-random 场景。
     conda run -n linetracker-py311 python data/synthetic/generate_dataset1.py \
-        --samples 100 --random-knobs --seed 20260717
+        --samples 100 --random-knobs true --seed 20260717
 
-本脚本只读取拟合结果，不读取原始 dataset1 MAT 文件。所有输出始终为 0/1
-布尔矩阵；概率坐标变量不表示返回幅值或累计光子数。
+本脚本只读取拟合结果，不读取原始 dataset1 MAT 文件。每个样本先生成二值背景，
+再生成带漏检的随机目标并做逻辑 OR。所有输出始终为 0/1 布尔矩阵；概率坐标变量
+不表示返回幅值或累计光子数。
 """
 
 from __future__ import annotations
@@ -27,6 +28,7 @@ import numpy as np
 
 RANGE_BINS = 300_000
 PROFILE_WIDTH_M = 1_000
+FRAME_INTERVAL_S = 0.05
 BACKGROUND_START_M = 10_000
 CHUNK_RANGE_BINS = 5_000
 REGIONS = (
@@ -40,6 +42,8 @@ HERE = Path(__file__).resolve().parent
 DEFAULT_FIT_DIR = HERE / "fit"
 DEFAULT_MODEL_PATH = DEFAULT_FIT_DIR / "dataset1_background_model.npz"
 DEFAULT_OUTPUT_DIR = HERE / "gen"
+DEFAULT_PREVIEW_MARGIN_M = 5_000.0
+DEFAULT_PREVIEW_POINT_SIZE = 3.0
 
 
 def _jsonable(value: Any) -> Any:
@@ -67,56 +71,152 @@ def _parse_bool(value: str) -> bool:
     raise argparse.ArgumentTypeError("应填写 true 或 false")
 
 
+def _format_path_value(value: float | int) -> str:
+    """将数值转换为紧凑且跨平台安全的目录名片段。"""
+    return f"{float(value):g}".replace("-", "m").replace(".", "p")
+
+
+def build_generation_directory_name(args: argparse.Namespace) -> str:
+    """根据影响样本内容的关键参数构造批次配置目录名。
+
+    B-random 场景中每个样本各自抽取五个背景旋钮，因此只在目录名中标记其模式；
+    固定背景场景则把五个旋钮值写入目录名。样本数和随机种子也参与命名，避免不同
+    批次意外写入同一个目录。
+    """
+    if args.random_knobs:
+        background_name = "B-random"
+    else:
+        background_name = "B-fixed-" + "-".join(
+            (
+                f"L{_format_path_value(args.level)}",
+                f"D{_format_path_value(args.decay)}",
+                f"N{_format_path_value(args.near_field)}",
+                f"G{_format_path_value(args.gain)}",
+                f"C{_format_path_value(args.cluster)}",
+            )
+        )
+    target_name = "-".join(
+        (
+            f"R{_format_path_value(args.range_min_m)}-{_format_path_value(args.range_max_m)}m",
+            f"V{_format_path_value(args.max_speed_mps)}",
+            f"A{_format_path_value(args.max_acceleration_mps2)}",
+            f"C{_format_path_value(args.curve_strength)}",
+            f"J{_format_path_value(args.measurement_jitter_std_m)}",
+            f"K{_format_path_value(args.response_multiplier)}",
+            "Q"
+            f"{_format_path_value(args.min_injection_probability)}-"
+            f"{_format_path_value(args.max_injection_probability)}",
+        )
+    )
+    return "_".join(
+        (
+            f"F{args.frames}",
+            f"N{args.samples}",
+            f"S{args.seed}",
+            background_name,
+            f"T-{target_name}",
+        )
+    )
+
+
+def resolve_generation_output_dir(
+    output_root: Path,
+    args: argparse.Namespace,
+) -> Path:
+    """在生成根目录下定位本批次关键参数对应的配置目录。"""
+    return Path(output_root) / build_generation_directory_name(args)
+
+
 def load_model(path: Path = DEFAULT_MODEL_PATH) -> dict[str, np.ndarray]:
     """读取 fit_dataset1.py 输出的 NPZ 模型，且不启用 pickle。"""
     with np.load(path, allow_pickle=False) as archive:
         return {name: archive[name] for name in archive.files}
 
-def save_packed_background(
+def save_packed_sample(
     path: Path,
     background: np.ndarray,
+    observation: np.ndarray,
     metadata: dict[str, Any],
+    target: dict[str, Any],
 ) -> None:
-    """以 NPZ 位打包格式保存 bool 背景及其理论概率与紧凑元数据。"""
+    """保存一个含背景、目标叠加矩阵和航迹真值的位打包样本。
+
+    observation_packed 是轨迹检测算法的完整二值输入；background_only_packed
+    仅用于背景质量复核和带真值的预览图复现。
+    """
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    target_probability_1m = np.asarray(
+    background = np.asarray(background, dtype=np.bool_)
+    observation = np.asarray(observation, dtype=np.bool_)
+    if background.shape != observation.shape:
+        raise ValueError("background 与 observation 的形状必须一致。")
+
+    background_probability_1m = np.asarray(
         metadata["target_probability_1m"], dtype=np.float32
     )
-    target_probability_1km = np.asarray(metadata["target_probability_1km"])
-    frame_gains = np.asarray(metadata["frame_gains"])
     compact_metadata = dict(metadata)
     compact_metadata.pop("target_probability_1m", None)
     compact_metadata.pop("target_probability_1km", None)
     compact_metadata.pop("frame_gains", None)
+
     np.savez_compressed(
         path,
-        background_packed=np.packbits(background, axis=1),  # 将每帧的 300000 个 0/1 bin 打包为 37500 个 uint8 字节
-        # 保存生成前的 1 m 理论占据概率；质检时据此按 1 km 求均值，
-        # 使理论曲线与二值背景的经验 1 km 占据率使用完全相同的统计口径。
-        target_p_1m=target_probability_1m,
-        # 保留原有的 1 km 曲线，供旧版读取程序或空间簇标定排查使用。
-        target_p_1km=target_probability_1km,
-        frame_gains=frame_gains,
+        # 背景与完整观测矩阵均按距离维位打包：每帧 300000 个 0/1 bin 对应 37500 字节。
+        background_only_packed=np.packbits(background, axis=1),
+        observation_packed=np.packbits(observation, axis=1),
+        # 生成前的逐 1 m 背景响应率；用于背景曲线验收与三联图左图。
+        background_probability_1m=background_probability_1m,
+        # 目标真值：潜在连续距离、实际注入距离、是否注入及相关运动/概率量。
+        target_true_range_m=np.asarray(target["true_range_m"], dtype=np.float32),
+        target_measured_bin=np.asarray(target["measured_bin"], dtype=np.int32),
+        target_hit=np.asarray(target["hit"], dtype=np.bool_),
+        target_hit_bin=np.asarray(target["hit_bin"], dtype=np.int32),
+        target_velocity_mps=np.asarray(target["velocity_mps"], dtype=np.float32),
+        target_acceleration_mps2=np.asarray(target["acceleration_mps2"], dtype=np.float32),
+        target_p_background=np.asarray(target["p_background_on_track"], dtype=np.float32),
+        target_p_on=np.asarray(target["p_on_track"], dtype=np.float32),
+        target_injection_probability=np.asarray(
+            target["injection_probability"], dtype=np.float32
+        ),
         metadata_json=np.array(
             json.dumps(_jsonable(compact_metadata), ensure_ascii=False)
         ),
     )
 
 
-def load_packed_background(path: Path) -> tuple[np.ndarray, dict[str, Any]]:
-    """读取位打包背景文件，并恢复“帧 × 距离”bool 数组。"""
+def load_packed_sample(
+    path: Path,
+) -> tuple[np.ndarray, np.ndarray, dict[str, Any], dict[str, np.ndarray]]:
+    """读取样本，返回背景、完整观测矩阵、元数据和目标真值。"""
     with np.load(path, allow_pickle=False) as archive:
         metadata = json.loads(str(archive["metadata_json"]))
         background = np.unpackbits(
-            archive["background_packed"],
+            archive["background_only_packed"],
             axis=1,
             count=int(metadata["range_bins"]),
         ).astype(bool, copy=False)
-        metadata["target_probability_1m"] = archive["target_p_1m"].copy()
-        metadata["target_probability_1km"] = archive["target_p_1km"].copy()
-        metadata["frame_gains"] = archive["frame_gains"].copy()
-    return background, metadata
+        observation = np.unpackbits(
+            archive["observation_packed"],
+            axis=1,
+            count=int(metadata["range_bins"]),
+        ).astype(bool, copy=False)
+        metadata["background_probability_1m"] = archive[
+            "background_probability_1m"
+        ].copy()
+        target = {
+            "true_range_m": archive["target_true_range_m"].copy(),
+            "measured_bin": archive["target_measured_bin"].copy(),
+            "hit": archive["target_hit"].copy(),
+            "hit_bin": archive["target_hit_bin"].copy(),
+            "velocity_mps": archive["target_velocity_mps"].copy(),
+            "acceleration_mps2": archive["target_acceleration_mps2"].copy(),
+            "p_background_on_track": archive["target_p_background"].copy(),
+            "p_on_track": archive["target_p_on"].copy(),
+            "injection_probability": archive[
+                "target_injection_probability"
+            ].copy(),
+        }
+    return background, observation, metadata, target
 
 
 def profile_binary(background: np.ndarray) -> dict[str, Any]:
@@ -167,6 +267,249 @@ def profile_binary(background: np.ndarray) -> dict[str, Any]:
         },
     }
 
+
+
+def generate_target(
+    p_bg_1m: np.ndarray,
+    *,
+    frames: int,
+    range_min_m: float,
+    range_max_m: float,
+    max_speed_mps: float,
+    max_acceleration_mps2: float,
+    curve_strength: float,
+    smooth_window_frames: int,
+    measurement_jitter_std_m: float,
+    response_multiplier: float,
+    min_injection_probability: float,
+    max_injection_probability: float,
+    rng: np.random.Generator,
+) -> dict[str, Any]:
+    """生成一条随机潜在航迹、目标注入事件和对应真值。
+
+    先以平滑白噪声生成加速度，再递推得到限速轨迹。目标注入概率由参考背景
+    响应率和 response_multiplier 换算得到，并最终裁剪到给定上下限。
+    """
+    p_bg_1m = np.asarray(p_bg_1m, dtype=np.float64)
+    if p_bg_1m.shape != (RANGE_BINS,):
+        raise ValueError(f"p_bg_1m 的形状必须为 ({RANGE_BINS},)。")
+    if frames <= 0:
+        raise ValueError("frames 必须为正整数。")
+    if not 0.0 <= range_min_m < range_max_m <= RANGE_BINS:
+        raise ValueError("目标距离范围必须满足 0 <= min < max <= RANGE_BINS。")
+    if max_speed_mps <= 0.0 or max_acceleration_mps2 < 0.0:
+        raise ValueError("速度上限必须为正，加速度尺度上限必须非负。")
+    if smooth_window_frames <= 0:
+        raise ValueError("smooth_window_frames 必须为正整数。")
+    if measurement_jitter_std_m < 0.0:
+        raise ValueError("measurement_jitter_std_m 必须非负。")
+    if response_multiplier < 0.0:
+        raise ValueError("response_multiplier 必须非负。")
+    if not 0.0 <= min_injection_probability <= max_injection_probability <= 1.0:
+        raise ValueError("目标注入概率上下限必须满足 0 <= min <= max <= 1。")
+
+    # 生成低频加速度：长度为 W 的均值核会滤除高频帧间抖动。
+    window = min(int(smooth_window_frames), frames)
+    window = window if window % 2 == 1 else max(window - 1, 1)
+    kernel = np.ones(window, dtype=np.float64) / window
+    acceleration = np.convolve(rng.normal(size=frames), kernel, mode="same")
+    acceleration /= max(float(np.max(np.abs(acceleration))), 1e-12)
+    acceleration *= float(curve_strength) * float(max_acceleration_mps2)
+
+    # 递推速度，并约束每一帧的速度绝对值不超过 max_speed_mps。
+    velocity = np.empty(frames, dtype=np.float64)
+    velocity[0] = rng.uniform(-0.8 * max_speed_mps, 0.8 * max_speed_mps)
+    for frame_index in range(1, frames):
+        velocity[frame_index] = np.clip(
+            velocity[frame_index - 1]
+            + acceleration[frame_index - 1] * FRAME_INTERVAL_S,
+            -max_speed_mps,
+            max_speed_mps,
+        )
+
+    # 依据相对位移选择合法起点，确保整条潜在轨迹落在给定距离范围内。
+    displacement = np.r_[0.0, np.cumsum(velocity[:-1] * FRAME_INTERVAL_S)]
+    start_low = range_min_m - float(displacement.min())
+    start_high = range_max_m - float(displacement.max())
+    if start_low > start_high:
+        raise ValueError("设定距离域无法容纳当前随机轨迹。")
+    true_range_m = rng.uniform(start_low, start_high) + displacement
+
+    # 测距抖动仅影响实际注入的整数距离 bin，不改变潜在连续轨迹。
+    measured_bin = np.rint(
+        true_range_m + rng.normal(0.0, measurement_jitter_std_m, size=frames)
+    ).astype(np.int64)
+    measured_bin = np.clip(measured_bin, 0, RANGE_BINS - 1)
+
+    p_background_on_track = p_bg_1m[measured_bin]
+    candidate_probability = np.maximum(
+        p_background_on_track,
+        float(response_multiplier) * p_background_on_track,
+    )
+
+    # 反解“额外置 1”概率，并只由 min/max_injection_probability 统一裁剪。
+    raw_injection_probability = (
+        candidate_probability - p_background_on_track
+    ) / (1.0 - p_background_on_track)
+    injection_probability = np.clip(raw_injection_probability, 0.0, 1.0)
+    injection_probability = np.clip(
+        injection_probability,
+        min_injection_probability,
+        max_injection_probability,
+    )
+
+    # 每帧独立决定是否额外注入目标响应；与背景叠加由 overlay_target 完成。
+    hit = rng.random(frames) < injection_probability
+    hit_bin = np.where(hit, measured_bin, -1)
+    p_on_track = p_background_on_track + (
+        1.0 - p_background_on_track
+    ) * injection_probability
+
+    return {
+        "true_range_m": true_range_m,
+        "measured_bin": measured_bin,
+        "hit": hit,
+        "hit_bin": hit_bin,
+        "velocity_mps": velocity,
+        "acceleration_mps2": acceleration,
+        "p_background_on_track": p_background_on_track,
+        "p_on_track": p_on_track,
+        "injection_probability": injection_probability,
+        "max_step_m": float(max_speed_mps * FRAME_INTERVAL_S),
+        "expected_extra_responses": float(
+            np.sum((1.0 - p_background_on_track) * injection_probability)
+        ),
+    }
+
+
+def overlay_target(background: np.ndarray, target: dict[str, Any]) -> np.ndarray:
+    """将已注入的目标响应与背景做逻辑 OR，返回完整二值观测矩阵。"""
+    observation = np.asarray(background, dtype=np.bool_).copy()
+    hit = np.asarray(target["hit"], dtype=bool)
+    hit_bin = np.asarray(target["hit_bin"], dtype=np.int64)
+    if observation.shape != (hit.size, RANGE_BINS):
+        raise ValueError("background 的形状必须与目标帧数和 RANGE_BINS 一致。")
+    observation[np.flatnonzero(hit), hit_bin[hit]] = True
+    return observation
+
+
+def save_sample_preview(
+    path: Path,
+    background: np.ndarray,
+    observation: np.ndarray,
+    probability_1m: np.ndarray,
+    target: dict[str, Any],
+    margin_m: float = DEFAULT_PREVIEW_MARGIN_M,
+    point_size: float = DEFAULT_PREVIEW_POINT_SIZE,
+) -> None:
+    """保存三联图：背景概率、未标注观测、带目标真值的局部时距图。"""
+    if margin_m < 0.0 or point_size <= 0.0:
+        raise ValueError("margin_m 必须非负，point_size 必须为正。")
+
+    # 延迟导入，保证只调用背景函数时无需加载绘图库。
+    import matplotlib.pyplot as plt
+
+    plt.rcParams["font.sans-serif"] = ["Noto Sans CJK SC", "DejaVu Sans"]
+    plt.rcParams["axes.unicode_minus"] = False
+
+    probability_1m = np.asarray(probability_1m, dtype=np.float64)
+    frames = background.shape[0]
+    if background.shape != observation.shape or probability_1m.shape != (RANGE_BINS,):
+        raise ValueError("绘图输入的背景、观测矩阵或概率曲线形状不正确。")
+
+    p_bg_1km = probability_1m.reshape(-1, PROFILE_WIDTH_M).mean(axis=1)
+    centres_km = np.arange(p_bg_1km.size) + 0.5
+    time_s = np.arange(frames) * FRAME_INTERVAL_S
+    true_range_m = np.asarray(target["true_range_m"], dtype=np.float64)
+    true_range_km = true_range_m / 1_000.0
+    hit = np.asarray(target["hit"], dtype=bool)
+    hit_range_km = np.asarray(target["hit_bin"], dtype=np.int64)[hit] / 1_000.0
+
+    window_start = max(0, int(np.floor(true_range_m.min() - margin_m)))
+    window_stop = min(RANGE_BINS, int(np.ceil(true_range_m.max() + margin_m + 1.0)))
+    local_background = background[:, window_start:window_stop]
+    local_observation = observation[:, window_start:window_stop]
+    background_frames, background_bins = np.nonzero(local_background)
+    observation_frames, observation_bins = np.nonzero(local_observation)
+    local_ylim_km = (window_start / 1_000.0, window_stop / 1_000.0)
+
+    fig, axes = plt.subplots(1, 3, figsize=(18, 4.6), constrained_layout=True)
+
+    axes[0].semilogy(centres_km, p_bg_1km, color="#4c78a8", lw=1.2)
+    axes[0].axvspan(
+        true_range_km.min(),
+        true_range_km.max(),
+        color="#d62728",
+        alpha=0.16,
+        label="本次目标经过距离",
+    )
+    axes[0].set(
+        title="拟合模型恢复的背景占据概率",
+        xlabel="距离（km）",
+        ylabel="每 1 m bin 的占据概率",
+        xlim=(0, 300),
+    )
+    axes[0].legend(fontsize=8)
+
+    axes[1].scatter(
+        time_s[observation_frames],
+        (window_start + observation_bins) / 1_000.0,
+        s=point_size,
+        marker="s",
+        linewidths=0,
+        alpha=0.8,
+        color="#1f77b4",
+        rasterized=True,
+        label="二值响应（未标注）",
+    )
+    axes[1].set(
+        title="局部二值时距图（目标未标注）",
+        xlabel="时间（s）",
+        ylabel="距离（km）",
+        ylim=local_ylim_km,
+    )
+    axes[1].grid(alpha=0.25)
+    axes[1].legend(fontsize=8)
+
+    axes[2].scatter(
+        time_s[background_frames],
+        (window_start + background_bins) / 1_000.0,
+        s=point_size,
+        marker="s",
+        linewidths=0,
+        alpha=0.8,
+        color="#1f77b4",
+        rasterized=True,
+        label="背景响应",
+    )
+    axes[2].plot(
+        time_s,
+        true_range_km,
+        color="#202124",
+        lw=1.0,
+        alpha=0.85,
+        label="潜在轨迹",
+    )
+    axes[2].scatter(
+        time_s[hit],
+        hit_range_km,
+        s=4,
+        color="#d62728",
+        zorder=3,
+        label="实际目标响应",
+    )
+    axes[2].set(
+        title="背景叠加后的局部二值时距图",
+        xlabel="时间（s）",
+        ylabel="距离（km）",
+        ylim=local_ylim_km,
+    )
+    axes[2].legend(fontsize=8)
+
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(path, dpi=180)
+    plt.close(fig)
 
 
 def step_3_6_select_coefficients(
@@ -496,6 +839,109 @@ def generate_background(
     }
     return background, metadata
 
+
+def generate_sample(
+    model: dict[str, np.ndarray],
+    output_dir: Path,
+    index: int,
+    frames: int,
+    background_seed: int,
+    target_seed: int,
+    prefix: str,
+    level: float,
+    decay: float,
+    near_field: float,
+    gain: float,
+    cluster: float,
+    block_frames: int,
+    validate: bool,
+    target_config: dict[str, float | int],
+    preview_margin_m: float = DEFAULT_PREVIEW_MARGIN_M,
+    preview_point_size: float = DEFAULT_PREVIEW_POINT_SIZE,
+) -> dict[str, Any]:
+    """生成、保存一个含目标样本，并返回其轻量级清单记录。
+
+    单进程与并行脚本共用此函数，保证两种入口的背景、目标、落盘字段和预览图
+    完全一致。调用方负责预先确定该样本的五个背景旋钮及两个随机种子。
+    """
+    if preview_margin_m < 0.0 or preview_point_size <= 0.0:
+        raise ValueError("预览图的距离余量必须非负，点大小必须为正。")
+
+    output_dir = Path(output_dir)
+    target_config = dict(target_config)
+
+    # 先生成背景，再使用独立随机种子生成潜在航迹与目标注入事件。
+    background, metadata = generate_background(
+        model=model,
+        frames=frames,
+        seed=background_seed,
+        level=float(level),
+        decay=float(decay),
+        near_field=float(near_field),
+        gain=float(gain),
+        cluster=float(cluster),
+        block_frames=block_frames,
+    )
+    target = generate_target(
+        np.asarray(metadata["target_probability_1m"], dtype=np.float64),
+        frames=frames,
+        rng=np.random.default_rng(target_seed),
+        **target_config,
+    )
+    observation = overlay_target(background, target)
+
+    # 每个样本拥有独立目录，数据与对应三联检查图始终成对保存。
+    sample_dir = output_dir / f"{prefix}_{index:04d}"
+    data_path = sample_dir / "data.npz"
+    preview_path = sample_dir / "preview.png"
+    metadata = {
+        **metadata,
+        "target": {
+            "seed": target_seed,
+            "config": target_config,
+            "actual_injected_responses": int(np.count_nonzero(target["hit"])),
+            "expected_extra_responses": float(target["expected_extra_responses"]),
+        },
+    }
+    save_packed_sample(data_path, background, observation, metadata, target)
+    save_sample_preview(
+        preview_path,
+        background,
+        observation,
+        np.asarray(metadata["target_probability_1m"], dtype=np.float64),
+        target,
+        margin_m=preview_margin_m,
+        point_size=preview_point_size,
+    )
+
+    # 清单只保留复现、统计和定位样本所需的轻量级信息。
+    record: dict[str, Any] = {
+        "index": index,
+        "directory": sample_dir.name,
+        "data_file": str(data_path.relative_to(output_dir)),
+        "preview_file": str(preview_path.relative_to(output_dir)),
+        "background_seed": background_seed,
+        "target_seed": target_seed,
+        "normalized_knobs": metadata["normalized_knobs"],
+        "coefficients": metadata["coefficients"],
+        "target_fano_factor": metadata["target_fano_factor"],
+        "target_spatial_pair_ratio_10km_plus": (
+            metadata["target_spatial_pair_ratio_10km_plus"]
+        ),
+        "cluster_survival_1_to_3m": metadata["cluster_survival_1_to_3m"],
+        "target": metadata["target"],
+    }
+    if validate:
+        profile = profile_binary(background)
+        record["observed"] = {
+            "mean_events_per_frame": profile["mean_events_per_frame"],
+            "fano_factor": profile["fano_factor"],
+            "temporal_pair_ratio_10km_plus": profile["temporal_pair_ratio"],
+            "spatial_pair_ratio_10km_plus": profile["spatial_pair_ratio"],
+        }
+    return record
+
+
 def generate_batch(
     model: dict[str, np.ndarray],
     output_dir: Path,
@@ -511,14 +957,23 @@ def generate_batch(
     random_knobs: bool,
     block_frames: int,
     validate: bool,
+    target_config: dict[str, float | int],
+    preview_margin_m: float = DEFAULT_PREVIEW_MARGIN_M,
+    preview_point_size: float = DEFAULT_PREVIEW_POINT_SIZE,
 ) -> list[dict[str, Any]]:
-    """批量生成样本并返回可写入清单的轻量级记录。
+    """批量生成含目标的样本，并返回可写入清单的轻量级记录。
 
     random_knobs=False 时，所有样本使用同一组连续旋钮，仅随机种子不同；
     random_knobs=True 时，五个旋钮独立从 [-1,1] 均匀抽取，对应文档的 B-random 场景。
+    每个样本写入独立目录，其中含完整 NPZ 数据和三联预览图。
     """
     if samples <= 0:
         raise ValueError("samples must be positive")
+    if preview_margin_m < 0.0 or preview_point_size <= 0.0:
+        raise ValueError("预览图的距离余量必须非负，点大小必须为正。")
+
+    target_config = dict(target_config)
+
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     knob_rng = np.random.default_rng(seed)
@@ -529,44 +984,28 @@ def generate_batch(
             level_i, decay_i, near_field_i, gain_i, cluster_i = knob_rng.uniform(-1.0, 1.0, size=5)
         else:
             level_i, decay_i, near_field_i, gain_i, cluster_i = level, decay, near_field, gain, cluster
-        sample_seed = int(seed + index)
+        background_seed = int(seed + index)
+        target_seed = int(seed + 1_000_000 + index)
 
-        # 拟合背景
-        background, metadata = generate_background(
+        record = generate_sample(
             model=model,
+            output_dir=output_dir,
+            index=index,
             frames=frames,
-            seed=sample_seed,
+            background_seed=background_seed,
+            target_seed=target_seed,
+            prefix=prefix,
             level=float(level_i),
             decay=float(decay_i),
             near_field=float(near_field_i),
             gain=float(gain_i),
             cluster=float(cluster_i),
             block_frames=block_frames,
+            validate=validate,
+            target_config=target_config,
+            preview_margin_m=preview_margin_m,
+            preview_point_size=preview_point_size,
         )
-        output_path = output_dir / f"{prefix}_{index:04d}.npz"
-        save_packed_background(output_path, background, metadata)
-
-        # 记录元信息
-        record: dict[str, Any] = {
-            "index": index,
-            "file": output_path.name,
-            "seed": sample_seed,
-            "normalized_knobs": metadata["normalized_knobs"],
-            "coefficients": metadata["coefficients"],
-            "target_fano_factor": metadata["target_fano_factor"],
-            "target_spatial_pair_ratio_10km_plus": (
-                metadata["target_spatial_pair_ratio_10km_plus"]
-            ),
-            "cluster_survival_1_to_3m": metadata["cluster_survival_1_to_3m"],
-        }
-        if validate:
-            profile = profile_binary(background)
-            record["observed"] = {
-                "mean_events_per_frame": profile["mean_events_per_frame"],
-                "fano_factor": profile["fano_factor"],
-                "temporal_pair_ratio_10km_plus": profile["temporal_pair_ratio"],
-                "spatial_pair_ratio_10km_plus": profile["spatial_pair_ratio"],
-            }
         records.append(record)
     return records
 
@@ -575,10 +1014,10 @@ def build_parser() -> argparse.ArgumentParser:
     """构建批量生成命令行参数。"""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", type=Path, default=DEFAULT_MODEL_PATH)
-    parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
+    parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR, help="生成根目录；其下会自动创建参数命名的批次目录")
     parser.add_argument("--manifest", type=Path, default=None)
     parser.add_argument("--prefix", type=str, default="dataset1_synthetic")
-    parser.add_argument("--samples", type=int, default=1)
+    parser.add_argument("--samples", type=int, default=100)
     parser.add_argument("--frames", type=int, default=300, help="每个样本的帧数")
     parser.add_argument("--seed", type=int, default=20260717)
     parser.add_argument("--block-frames", type=int, default=16, help="每次生成的帧块数，限制峰值内存")
@@ -597,17 +1036,86 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--validate", type=_parse_bool, default=True, 
         help="是否为每个样本额外计算并写入经验诊断量，批量较大时会较慢"
     )
+
+    parser.add_argument("--preview-margin-m", type=float, default=5_000.0, help="三联预览图在航迹两端保留的距离余量（m）")
+    parser.add_argument("--preview-point-size", type=float, default=3.0, help="局部时距图中方形二值响应点的面积（pt²）")
+    target_group = parser.add_argument_group("目标合成参数")
+    target_group.add_argument("--range-min-m", type=float, default=10_000.0, help="潜在轨迹允许的最小距离（m）")
+    target_group.add_argument("--range-max-m", type=float, default=290_000.0, help="潜在轨迹允许的最大距离（m）")
+    target_group.add_argument("--max-speed-mps", type=float, default=340.0, help="目标速度绝对值上限（m/s）")
+    target_group.add_argument("--max-acceleration-mps2", type=float, default=6.0, help="加速度尺度上限（m/s²）")
+    target_group.add_argument("--curve-strength", type=float, default=10.0, help="曲率强度；0 时生成严格直线")
+    target_group.add_argument("--smooth-window-frames", type=int, default=31, help="加速度移动平均窗口（帧）")
+    target_group.add_argument("--measurement-jitter-std-m", type=float, default=1.0, help="目标响应测距抖动的标准差（m）")
+    target_group.add_argument("--response-multiplier", type=float, default=300.0, help="目标相对背景响应倍率 kappa")
+    target_group.add_argument("--min-injection-probability", type=float, default=0.35, help="目标额外注入响应的逐帧概率下限")
+    target_group.add_argument("--max-injection-probability", type=float, default=0.95, help="目标额外注入响应的逐帧概率上限")
     return parser
 
+
+def target_config_from_args(args: argparse.Namespace) -> dict[str, float | int]:
+    """从两个生成入口共用的命令行参数中整理目标合成配置。"""
+    return {
+        "range_min_m": args.range_min_m,
+        "range_max_m": args.range_max_m,
+        "max_speed_mps": args.max_speed_mps,
+        "max_acceleration_mps2": args.max_acceleration_mps2,
+        "curve_strength": args.curve_strength,
+        "smooth_window_frames": args.smooth_window_frames,
+        "measurement_jitter_std_m": args.measurement_jitter_std_m,
+        "response_multiplier": args.response_multiplier,
+        "min_injection_probability": args.min_injection_probability,
+        "max_injection_probability": args.max_injection_probability,
+    }
+
+
+def build_generation_hyperparameters(args: argparse.Namespace) -> dict[str, Any]:
+    """整理会影响样本内容、诊断或预览结果的完整批次超参数。"""
+    return {
+        "data_geometry": {
+            "range_bins": RANGE_BINS,
+            "frame_interval_s": FRAME_INTERVAL_S,
+            "frames_per_sample": int(args.frames),
+        },
+        "batch": {
+            "samples": int(args.samples),
+            "seed": int(args.seed),
+            "prefix": str(args.prefix),
+        },
+        "background": {
+            "random_knobs": bool(args.random_knobs),
+            "fixed_knobs": {
+                "level": float(args.level),
+                "decay": float(args.decay),
+                "near_field": float(args.near_field),
+                "gain": float(args.gain),
+                "cluster": float(args.cluster),
+            },
+            "random_knob_distribution": (
+                "independent_uniform[-1,1]"
+                if args.random_knobs
+                else None
+            ),
+            "block_frames": int(args.block_frames),
+        },
+        "target": target_config_from_args(args),
+        "preview": {
+            "margin_m": float(args.preview_margin_m),
+            "background_point_size": float(args.preview_point_size),
+        },
+        "diagnostics": {"validate": bool(args.validate)},
+    }
+
+
 def main(argv: Iterable[str] | None = None) -> None:
-    """读取模型、批量生成背景，并写出 JSON 清单。"""
+    """读取模型、批量生成含随机目标的样本，并写出 JSON 清单。"""
     parser = build_parser()
     args = parser.parse_args(argv)
 
-    args.samples = 100
-    args.random_knobs = True
-    args.validate = True
-
+    output_root = Path(args.output_dir)
+    args.output_dir = resolve_generation_output_dir(args.output_dir, args)
+    target_config = target_config_from_args(args)
+    hyperparameters = build_generation_hyperparameters(args)
     model = load_model(args.model)
     records = generate_batch(
         model=model,
@@ -624,22 +1132,28 @@ def main(argv: Iterable[str] | None = None) -> None:
         random_knobs=args.random_knobs,
         block_frames=args.block_frames,
         validate=args.validate,
+        target_config=target_config,
+        preview_margin_m=args.preview_margin_m,
+        preview_point_size=args.preview_point_size,
     )
     manifest_path = args.manifest or args.output_dir / "batch_manifest.json"
     manifest_path.parent.mkdir(parents=True, exist_ok=True)
     manifest = {
         "model": str(Path(args.model).resolve()),
+        "output_root": str(output_root.resolve()),
         "output_dir": str(Path(args.output_dir).resolve()),
         "samples": args.samples,
         "frames_per_sample": args.frames,
         "random_knobs": args.random_knobs,
+        "target_config": target_config,
+        "hyperparameters": hyperparameters,
         "records": records,
     }
     manifest_path.write_text(
         json.dumps(_jsonable(manifest), ensure_ascii=False, indent=2) + "\n",
         encoding="utf-8",
     )
-    print(f"已生成 {len(records)} 个二值背景文件：{args.output_dir}")
+    print(f"已生成 {len(records)} 个含目标二值样本目录：{args.output_dir}")
     print(f"批次清单：{manifest_path}")
 
 
