@@ -130,8 +130,8 @@ def main(argv: Iterable[str] | None = None) -> None:
     parser = build_parallel_parser()
     args = parser.parse_args(argv)
 
-    args.samples = 20000
-    args.workers = 10
+    args.samples = 200
+    args.workers = 5
 
     if args.samples <= 0:
         parser.error("--samples 必须为正整数")
