@@ -1017,7 +1017,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR, help="生成根目录；其下会自动创建参数命名的批次目录")
     parser.add_argument("--manifest", type=Path, default=None)
     parser.add_argument("--prefix", type=str, default="dataset1_synthetic")
-    parser.add_argument("--samples", type=int, default=100)
+    parser.add_argument("--samples", type=int, default=10)
     parser.add_argument("--frames", type=int, default=300, help="每个样本的帧数")
     parser.add_argument("--seed", type=int, default=20260717)
     parser.add_argument("--block-frames", type=int, default=16, help="每次生成的帧块数，限制峰值内存")

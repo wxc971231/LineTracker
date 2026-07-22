@@ -129,6 +129,10 @@ def main(argv: Iterable[str] | None = None) -> None:
     """并行调度样本生成，并在主进程统一写出批次清单。"""
     parser = build_parallel_parser()
     args = parser.parse_args(argv)
+
+    args.samples = 20000
+    args.workers = 10
+
     if args.samples <= 0:
         parser.error("--samples 必须为正整数")
     if args.workers <= 0:
