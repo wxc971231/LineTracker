@@ -161,26 +161,35 @@ def save_packed_sample(
 
     np.savez_compressed(
         path,
-        # 背景与完整观测矩阵均按距离维位打包：每帧 300000 个 0/1 bin 对应 37500 字节。
+        # bool [F, R] 背景矩阵按距离轴位打包后的 uint8 [F, ceil(R/8)]，当前 F=300、R=300000 时形状为 [300, 37500]。
+        # 仅用于背景质量复核、统计和预览，不作为检测算法的输入
         background_only_packed=np.packbits(background, axis=1),
+        # bool [F, R] “背景+目标” 完整观测矩阵按距离轴位打包后的 uint8 [F, ceil(R/8)]，当前 F=300、R=300000 时形状为 [300, 37500]。
+        # 这是轨迹检测算法唯一可见的原始 0/1 输入。
         observation_packed=np.packbits(observation, axis=1),
-        # 生成前的逐 1 m 背景响应率；用于背景曲线验收与三联图左图。
+        # float32 [R]，当前为 [300000]：生成前的逐 1 m 背景响应概率模板，用于验收背景分布或构造背景特征
         background_probability_1m=background_probability_1m,
-        # 目标真值：潜在连续距离、实际注入距离、是否注入及相关运动/概率量。
+        # float32 [F]：浮点值表示的目标真实轨迹距离（m），不受测距抖动或漏检影响，这是数据合成器的 oracle 真值
         target_true_range_m=np.asarray(target["true_range_m"], dtype=np.float32),
+        # int32 [F]：潜在轨迹加测距抖动后对应的 1 m 整数 bin，即使漏检帧也有值。仅用于数据合成器质量分析
         target_measured_bin=np.asarray(target["measured_bin"], dtype=np.int32),
+        # bool [F]：是否额外注入了目标响应的逐帧bool标签，用于建立有效响应掩码，并统计时间窗内实际注入目标响应的总帧数 H
         target_hit=np.asarray(target["hit"], dtype=np.bool_),
+        # int32 [F]：实际注入目标响应所在的 1 m bin；
+        # hit=True 时等于 target_measured_bin；hit=False 时为 -1
         target_hit_bin=np.asarray(target["hit_bin"], dtype=np.int32),
+        # float32 [F]：目标的逐帧速度（m/s），用于运动真值评估或诊断。
         target_velocity_mps=np.asarray(target["velocity_mps"], dtype=np.float32),
+        # float32 [F]：目标的逐帧加速度（m/s²），用于曲率强度和运动真值评估。
         target_acceleration_mps2=np.asarray(target["acceleration_mps2"], dtype=np.float32),
+        # float32 [F]：目标测距 bin 处的背景响应概率，仅用于生成过程复核。
         target_p_background=np.asarray(target["p_background_on_track"], dtype=np.float32),
+        # float32 [F]：背景与目标逻辑 OR 后，该目标位置的总响应概率，用于检查目标叠加概率是否符合设定
         target_p_on=np.asarray(target["p_on_track"], dtype=np.float32),
-        target_injection_probability=np.asarray(
-            target["injection_probability"], dtype=np.float32
-        ),
-        metadata_json=np.array(
-            json.dumps(_jsonable(compact_metadata), ensure_ascii=False)
-        ),
+        # float32 [F]：逐帧 “额外置 1” 的目标注入概率；用于生成参数复核，
+        target_injection_probability=np.asarray(target["injection_probability"], dtype=np.float32),
+        # 样本的背景超参数、目标超参数和统计元数据的 JSON。
+        metadata_json=np.array(json.dumps(_jsonable(compact_metadata), ensure_ascii=False)),
     )
 
 
