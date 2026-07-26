@@ -39,7 +39,7 @@ torchrun --standalone --nproc_per_node=2 train/train_ddp.py \
 ```bash
 torchrun --standalone --nproc_per_node=1 train/train_ddp.py \
   --config simplecnn_v1 \
-  --set wandb_enabled=false
+  --set wandb_mode=disabled
 ```
 
 每次训练会在 `runs/<run_name>/<timestamp>/` 下保存解析后的配置、固定数据划分、验证/测试网格清单、`last.pt`、`best.pt` 与有限数量的 step checkpoint。

@@ -25,8 +25,8 @@ class WandbLogger:
         run_dir: Path,
         resume_id: str | None = None,
     ) -> "WandbLogger":
-        """只在 rank 0 初始化 W&B；关闭时返回空 logger。"""
-        if not config.wandb_enabled or not context.is_main:
+        """仅在 rank 0 且 wandb_mode 非 disabled 时初始化 W&B。"""
+        if not context.is_main or config.wandb_mode == "disabled":
             return cls(enabled=False)
 
         try:

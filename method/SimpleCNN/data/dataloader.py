@@ -640,7 +640,11 @@ def _records_from_json(items: Sequence[dict[str, str]], data_root: Path) -> tupl
 
 
 def _build_or_load_split(config: SimpleCNNConfig, split_path: Path) -> dict[str, tuple[SourceRecord, ...]]:
-    """按完整序列创建或读取可复现的 train/val/test 划分。"""
+    """按完整序列创建或读取可复现的 train/val/test 划分。
+
+    新建划分时，先按路径稳定排序，并按 ``source_sample_limit`` 截取前 N
+    份序列，再随机划分；已落盘的划分始终直接复用，避免验证集发生漂移。
+    """
     if split_path.exists():
         content = json.loads(split_path.read_text(encoding="utf-8"))
         return {
@@ -649,6 +653,8 @@ def _build_or_load_split(config: SimpleCNNConfig, split_path: Path) -> dict[str,
         }
 
     records = discover_sources(config.data_root)
+    if config.source_sample_limit > 0:
+        records = records[: config.source_sample_limit]
     rng = np.random.default_rng(config.split_seed)
     order = rng.permutation(len(records))
     shuffled = [records[int(index)] for index in order]
@@ -667,6 +673,8 @@ def _build_or_load_split(config: SimpleCNNConfig, split_path: Path) -> dict[str,
             {
                 "data_root": str(config.data_root),
                 "split_seed": config.split_seed,
+                "source_sample_limit": config.source_sample_limit,
+                "selected_source_count": len(records),
                 "splits": {name: _records_to_json(items, config.data_root) for name, items in splits.items()},
             },
             ensure_ascii=False,
@@ -682,17 +690,17 @@ def _build_grid_manifest(
     config: SimpleCNNConfig,
     output_path: Path,
 ) -> None:
-    """把固定标准时间—距离网格的标签保存为轻量元数据清单。"""
-    source_index_rows: list[int] = []
-    time_rows: list[int] = []
-    range_rows: list[int] = []
-    mask_rows: list[np.ndarray] = []
-    bin_rows: list[np.ndarray] = []
-    q_rows: list[np.float32] = []
-    m_line_rows: list[bool] = []
-    positive_rows: list[bool] = []
-    relation_rows: list[np.int8] = []
-    distance_starts = standard_distance_starts(config)
+    """针对 val 和 test 数据集，把固定的标准时间—距离网格的标签保存为轻量元数据清单。"""
+    source_index_rows: list[int] = []       # 每个网格块所属完整序列在 records 中的索引。
+    time_rows: list[int] = []               # 每个网格块的 20 帧时间窗起点（帧）。
+    range_rows: list[int] = []              # 每个网格块的 10 km 距离窗起点（m/bin）。
+    mask_rows: list[np.ndarray] = []        # 每块的 I_τ，形状 [20]，逐帧标记实际目标响应。
+    bin_rows: list[np.ndarray] = []         # 每块的 d_τ，形状 [20]；逐帧目标响应位置，无响应帧填 -1。
+    q_rows: list[np.float32] = []           # 每块的质量标签 q*=H/20。
+    m_line_rows: list[bool] = []            # 每块是否参与逐帧几何 Huber 损失。
+    positive_rows: list[bool] = []          # 每块是否完整包含潜在轨迹且至少有一次实际响应。
+    relation_rows: list[np.int8] = []       # 潜在轨迹关系：0=不相交，1=完整包含，2=部分相交。
+    distance_starts = standard_distance_starts(config)  # 推理一致的 34 个标准距离块起点。
 
     for source_index, record in enumerate(records):
         source = PackedSource(record)
@@ -728,15 +736,20 @@ def _build_grid_manifest(
 
 def prepare_data_artifacts(config: SimpleCNNConfig, artifact_dir: Path) -> DataArtifacts:
     """创建一次实验需要的 source 划分和固定验证/测试网格清单。"""
+    # 创建实验的数据目录和数据划分
     artifact_dir.mkdir(parents=True, exist_ok=True)
     split_path = artifact_dir / "split_manifest.json"
     splits = _build_or_load_split(config, split_path)
+
+    # 首次运行时生成 val 与 test 数据网格，包括标准分块的位置和标签信息
     validation_manifest_path = artifact_dir / "validation_grid.npz"
     test_manifest_path = artifact_dir / "test_grid.npz"
     if not validation_manifest_path.exists():
         _build_grid_manifest(splits["val"], config, validation_manifest_path)
     if not test_manifest_path.exists():
         _build_grid_manifest(splits["test"], config, test_manifest_path)
+
+    # 返回的数据划分和val/test网格路径
     return DataArtifacts(
         split_path=split_path,
         validation_manifest_path=validation_manifest_path,
