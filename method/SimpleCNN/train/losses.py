@@ -26,6 +26,22 @@ class LossOutput:
     point_count: torch.Tensor
 
 
+def _huber_loss_per_point(
+    prediction: torch.Tensor,
+    target: torch.Tensor,
+    delta: float,
+) -> torch.Tensor:
+    """返回逐元素 Huber 损失；NPU 使用等价的原生基础算子避免 CPU 回退。"""
+    if prediction.device.type != "npu":
+        return functional.huber_loss(prediction, target, reduction="none", delta=delta)
+
+    residual_abs = (prediction - target).abs()
+    delta_tensor = torch.as_tensor(delta, device=prediction.device, dtype=prediction.dtype)
+    quadratic = 0.5 * residual_abs.square()
+    linear = delta_tensor * (residual_abs - 0.5 * delta_tensor)
+    return torch.where(residual_abs <= delta_tensor, quadratic, linear)
+
+
 def compute_losses(
     prediction: dict[str, torch.Tensor],
     batch: dict[str, torch.Tensor],
@@ -37,28 +53,33 @@ def compute_losses(
     ``rho_m + nu_mpf * (tau - 9.5)``。仅在 $I_\tau=1$ 且该块
     ``m_line=True`` 时，才将它与实际响应 bin $d_\tau$ 比较。
     """
+    # 模型前向可以使用 FP16/BF16，但损失与指标统计始终提升到 FP32。
+    # 距离残差可达到几十万 bin，若沿用 FP16，平方和甚至 Huber 累加
+    # 都可能在一次 batch 内溢出为 inf。
+    q_logit = prediction["q_logit"].float()
     q_target = batch["q"].float()
     q_per_sample = functional.binary_cross_entropy_with_logits(
-        prediction["q_logit"], q_target, reduction="none"
+        q_logit, q_target, reduction="none"
     )
     q_loss_sum = q_per_sample.sum()
     q_count = torch.tensor(float(q_per_sample.numel()), device=q_per_sample.device)
     q_loss = q_loss_sum / q_count.clamp_min(1.0)
 
-    frame_index = torch.arange(config.frames_per_window, device=q_per_sample.device, dtype=prediction["rho_m"].dtype)
+    frame_index = torch.arange(
+        config.frames_per_window,
+        device=q_per_sample.device,
+        dtype=torch.float32,
+    )
     tau_zero = (config.frames_per_window - 1) / 2.0
-    predicted_bin = prediction["rho_m"].unsqueeze(1) + prediction["nu_mpf"].unsqueeze(1) * (
+    rho_m = prediction["rho_m"].float()
+    nu_mpf = prediction["nu_mpf"].float()
+    predicted_bin = rho_m.unsqueeze(1) + nu_mpf.unsqueeze(1) * (
         frame_index.unsqueeze(0) - tau_zero
     )
     point_mask = batch["I"].bool() & batch["m_line"].bool().unsqueeze(1)
-    target_bin = batch["d"].to(dtype=predicted_bin.dtype)
+    target_bin = batch["d"].float()
     residual = predicted_bin - target_bin
-    huber_per_point = functional.huber_loss(
-        predicted_bin,
-        target_bin,
-        reduction="none",
-        delta=config.huber_delta_bins,
-    )
+    huber_per_point = _huber_loss_per_point(predicted_bin, target_bin, config.huber_delta_bins)
 
     # 先按每个块的响应数归一化，再仅在 m_line 块之间平均，
     # 避免目标响应更多的块仅因点数更多而获得更大总权重。
@@ -66,14 +87,10 @@ def compute_losses(
     point_count_per_block = point_mask.sum(dim=1)
     line_sum_per_block = (huber_per_point * point_mask).sum(dim=1)
     line_per_block = line_sum_per_block / point_count_per_block.clamp_min(1)
-    line_count = valid_block.sum().to(dtype=predicted_bin.dtype)
-    if bool(valid_block.any()):
-        line_loss_sum = line_per_block[valid_block].sum()
-        line_loss = line_loss_sum / line_count
-    else:
-        # 保持与模型图相连，避免 DDP 下出现没有梯度的 Python 常量。
-        line_loss_sum = prediction["rho_m"].sum() * 0.0
-        line_loss = line_loss_sum
+    valid_block_float = valid_block.to(dtype=predicted_bin.dtype)
+    line_count = valid_block_float.sum()
+    line_loss_sum = (line_per_block * valid_block_float).sum()
+    line_loss = line_loss_sum / line_count.clamp_min(1.0)
 
     point_mask_float = point_mask.to(dtype=predicted_bin.dtype)
     abs_error_sum = (residual.abs() * point_mask_float).sum()

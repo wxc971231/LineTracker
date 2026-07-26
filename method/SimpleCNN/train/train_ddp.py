@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import sys
+import traceback
 from datetime import datetime
 from pathlib import Path
 
@@ -19,33 +20,52 @@ from configs.base import (
     parse_entrypoint_args,
     save_config_json,
 )
-from data.dataloader import build_train_dataloader, build_validation_dataloader, prepare_data_artifacts
+from data.dataloader import (
+    StandardGridDataset,
+    build_train_dataloader,
+    build_validation_dataloader,
+    prepare_data_artifacts,
+)
+from runtime.settings import apply_device_defaults, apply_runtime_settings, load_runtime_settings
 from train.trainer import Trainer
 from utils.checkpoint import load_checkpoint
-from utils.distributed import barrier, cleanup_distributed, rank_zero_print, setup_distributed
+from utils.distributed import (
+    barrier,
+    broadcast_object,
+    broadcast_path,
+    cleanup_distributed,
+    rank_zero_print,
+    setup_distributed,
+)
 from utils.logging import WandbLogger
+from utils.run_naming import build_experiment_slug
 from utils.seed import seed_everything
 
 
-def _resolve_run(config, resume_path: Path | None, is_main: bool) -> Path:
+def _resolve_run(config, resume_path: Path | None, world_size: int) -> Path:
     """新训练创建时间戳目录；恢复训练沿用原 run 目录。"""
     if resume_path is not None:
         return resume_path.resolve().parent.parent
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    run_dir = config.output_root / config.run_name / timestamp
-    if is_main:
-        run_dir.mkdir(parents=True, exist_ok=False)
+    experiment_slug = build_experiment_slug(config, world_size)
+    run_dir = config.output_root / config.run_name / experiment_slug / timestamp
     return run_dir
+
+def _next_data_stream_generation(payload: dict | None) -> int:
+    """新训练从 0 开始；每次恢复切换到一个新的可复现在线采样流。"""
+    if payload is None:
+        return 0
+    try:
+        generation = int(payload.get("data_stream_generation", 0))
+    except (TypeError, ValueError) as error:
+        raise ValueError("checkpoint 的 data_stream_generation 无效。") from error
+    if generation < 0:
+        raise ValueError("checkpoint 的 data_stream_generation 不得为负。")
+    return generation + 1
+
 
 if __name__ == "__main__":
     """准备 DDP、固定数据清单、W&B 并启动按 step 的训练。"""
-
-    # 在 Ampere 及更新 GPU 上允许 TF32，可加速卷积和矩阵乘法。
-    if torch.cuda.is_available():
-        torch.set_float32_matmul_precision("high")
-
-    # 初始化 DDP 和 logger
-    context = setup_distributed()
 
     # 入口参数，可被命令行覆盖
     args = parse_entrypoint_args(
@@ -53,6 +73,14 @@ if __name__ == "__main__":
         resume=None,                # 要恢复的 last.pt checkpoint 路径
         overrides=(),               # 需要覆盖的参数字段，如 ("batch_size_per_gpu=16",)。
     )
+
+    # .env 只处理机器、设备与路径；--set 仍是算法超参数的最高优先级覆盖方式。
+    runtime_settings = load_runtime_settings(args.env_file)
+    context = setup_distributed(runtime_settings)
+
+    # 在 Ampere 及更新 GPU 上允许 TF32，可加速卷积和矩阵乘法。
+    if context.device.type == "cuda":
+        torch.set_float32_matmul_precision("high")
 
     # 尝试加载实验参数并启动训练
     logger: WandbLogger | None = None
@@ -64,32 +92,69 @@ if __name__ == "__main__":
             config.resume = resume_path
         else:
             config = load_profile(args.config)
+        config = apply_runtime_settings(config, runtime_settings)
+        config = apply_device_defaults(config, runtime_settings, context.device.type)
         config = apply_overrides(config, args.set)
         config.validate()
 
         # 恢复训练沿用 checkpoint 所在实验目录；新训练在覆盖参数生效后创建目录。
-        run_dir = (
-            resume_path.parent.parent
-            if resume_path is not None
-            else _resolve_run(config, None, context.is_main)
+        if resume_path is not None:
+            run_dir = resume_path.parent.parent
+        else:
+            main_run_dir = (
+                str(_resolve_run(config, None, context.world_size))
+                if context.is_main
+                else None
+            )
+            run_dir = Path(broadcast_path(context, main_run_dir))
+        barrier(context)
+
+        # 在构造在线 DataLoader 前读取恢复代次，确保不会重播旧数据流开头。
+        resume_payload = load_checkpoint(config.resume, context.device) if config.resume is not None else None
+        data_stream_generation = _next_data_stream_generation(resume_payload)
+        resume_wandb_id = (
+            None if resume_payload is None else resume_payload.get("wandb_id")
         )
-        barrier(context)
 
-        # 仅由 rank 0 落盘配置、完整序列划分和固定验证/测试网格，避免多卡并发写文件
+        # 仅由 rank 0 落盘配置、完整序列划分和验证网格，再把结果广播给其他 rank。
+        preparation_result = None
+        rank_zero_validation_dataset: StandardGridDataset | None = None
         if context.is_main:
-            run_dir.mkdir(parents=True, exist_ok=True)
-            save_config_json(config, run_dir / "resolved_config.json")
-            prepare_data_artifacts(config, run_dir / "data")
-
-        # 等待 rank 0 写完后，各 rank 再读取同一份划分与网格清单
-        barrier(context)
-        artifacts = prepare_data_artifacts(config, run_dir / "data")
+            try:
+                run_dir.mkdir(parents=True, exist_ok=True)
+                save_config_json(config, run_dir / "resolved_config.json")
+                artifacts = prepare_data_artifacts(
+                    config,
+                    run_dir / "data",
+                    include_test_manifest=False,
+                )
+                rank_zero_validation_dataset = StandardGridDataset(
+                    artifacts.validation_manifest_path,
+                    config,
+                    verify_cached_samples=True,
+                )
+                preparation_result = {"artifacts": artifacts, "error": None}
+            except Exception:
+                preparation_result = {
+                    "artifacts": None,
+                    "error": traceback.format_exc(),
+                }
+        preparation_result = broadcast_object(context, preparation_result)
+        if preparation_result["error"] is not None:
+            raise RuntimeError("rank 0 数据准备失败：\n" + str(preparation_result["error"]))
+        artifacts = preparation_result["artifacts"]
+        if artifacts is None:
+            raise RuntimeError("rank 0 未返回数据 artifacts。")
 
         # 各 rank 使用派生种子，避免在线随机裁剪完全重复。
-        effective_seed = seed_everything(config.seed, context.rank)
+        effective_seed = seed_everything(
+            config.seed + data_stream_generation * 1_000_000_007,
+            context.rank,
+        )
         rank_zero_print(
             context,
-            f"run={run_dir}  world_size={context.world_size}  seed={effective_seed} "
+            f"run={run_dir}  device={context.device}  backend={context.backend} "
+            f"world_size={context.world_size}  seed={effective_seed}  stream={data_stream_generation} "
             f"train_sources={len(artifacts.train_sources)}  val_sources={len(artifacts.validation_sources)}",
         )
 
@@ -99,20 +164,16 @@ if __name__ == "__main__":
             artifacts.train_sources,
             rank=context.rank,
             world_size=context.world_size,
+            stream_generation=data_stream_generation,
         )
         validation_loader = build_validation_dataloader(
             config,
             artifacts.validation_manifest_path,
             rank=context.rank,
             world_size=context.world_size,
+            dataset=rank_zero_validation_dataset if context.is_main else None,
         )
 
-        # 尝试加载 ckpt
-        resume_payload = None
-        resume_wandb_id = None
-        if config.resume is not None:
-            resume_payload = load_checkpoint(config.resume, context.device)
-            resume_wandb_id = resume_payload.get("wandb_id")
         logger = WandbLogger.create(config, context, run_dir, resume_id=resume_wandb_id)
         
         # 启动训练
@@ -124,6 +185,10 @@ if __name__ == "__main__":
             validation_loader,
             logger,
             resume_payload=resume_payload,
+            data_stream_generation=data_stream_generation,
+            validation_dataset_id=(
+                f"{config.data_root}::{artifacts.validation_manifest_path.name}"
+            ),
         )
         trainer.train()
     finally:

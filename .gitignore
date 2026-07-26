@@ -221,4 +221,4 @@ __marimo__/
 data/raw/dataset1
 data/raw/dataset260707
 data/synthetic/gen
-
+method/SimpleCNN/kernel_meta/

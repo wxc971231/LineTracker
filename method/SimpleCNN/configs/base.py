@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import importlib
 import json
+import math
 from dataclasses import asdict, dataclass, fields
 from pathlib import Path
 from typing import Any, Sequence
@@ -12,10 +13,8 @@ from typing import Any, Sequence
 
 METHOD_ROOT = Path(__file__).resolve().parents[1]
 PROJECT_ROOT = METHOD_ROOT.parents[1]
-DEFAULT_DATA_ROOT = (
-    PROJECT_ROOT
-    / "data/synthetic/gen/F300_N200_S20260717_B-random_T-R10000-290000m-V340-A6-C10-J1-K300-Q0p35-0p95"
-)
+# 仅作为未配置 LT_DATA_ROOT 时的仓库内兜底；正式训练应在 .env 中指定数据集根目录。
+DEFAULT_DATA_ROOT = PROJECT_ROOT / "data" / "synthetic" / "gen"
 
 
 @dataclass
@@ -28,20 +27,20 @@ class SimpleCNNConfig:
 
     # 实验与随机性
     profile: str = "simplecnn_v1"                   # 当前加载的 configs profile 名称，用于写入实验配置快照。
-    run_name: str = "simplecnn_v1"                  # 本次实验名；决定 runs/ 下的一级输出目录。
+    run_name: str = "simplecnn_v1"                  # 实验系列名；决定 runs/<run_name>/<参数摘要>/<时间戳>/ 的一级目录。
     seed: int = 42                                  # 全局随机种子；rank 和 DataLoader worker 会派生各自子种子。
     output_root: Path = METHOD_ROOT / "runs"        # 所有训练运行目录的根路径。
-    data_root: Path = DEFAULT_DATA_ROOT             # 合成完整序列根目录；其下每个子目录含一份 data.npz。
+    data_root: Path = DEFAULT_DATA_ROOT             # 合成数据集根目录；由 .env 的 LT_DATA_ROOT 按机器覆盖，其下每个子目录含 data.npz。
 
     # 完整数据集划分
     split_seed: int = 42                            # 按完整序列随机划分 train/val/test 时使用的固定种子。
-    source_sample_limit: int = 100                  # 划分前按稳定路径排序仅取前 N 份完整序列；0 表示使用 data_root 下全部序列。
+    source_sample_limit: int = 100                  # 划分前按文件系统目录顺序仅取前 N 份完整序列；0 表示使用 data_root 下全部序列。
     train_fraction: float = 0.80                    # 完整序列划入训练集的比例。
     val_fraction: float = 0.10                      # 完整序列划入验证集的比例。
     test_fraction: float = 0.10                     # 完整序列划入测试集的比例；三者之和必须为 1。
 
     # 分块与压缩观测
-    frames_per_window: int = 20                     # 每个局部输入块的连续帧数；SimpleCNN-v1 固定为 10 km。
+    frames_per_window: int = 20                     # 每个局部输入块的连续帧数；SimpleCNN-v1 固定为 20 帧。
     range_bins: int = 300_000                       # 每帧总距离 bin 数；当前每个 bin 对应 1 m。
     block_width_m: int = 10_000                     # 单个局部块的距离宽度（m/bin）；SimpleCNN-v1 固定为 10 km。
     spatial_step_m: int = 9_000                     # 推理/验证标准分块的距离步进（m），相邻块重叠 1 km。
@@ -49,7 +48,7 @@ class SimpleCNNConfig:
 
     # 训练数据流
     num_workers: int = 0                            # 每个 rank 的 DataLoader 子进程数；0 表示在主训练进程中在线裁剪。
-    pin_memory: bool = True                         # 是否锁页 CPU batch 内存，以加快向 CUDA 设备传输。
+    pin_memory: bool = True                         # 是否锁页 CPU batch 内存；NPU 通常由运行时 .env 关闭。
     source_cache_size: int = 4                      # 每个 rank/worker 同时缓存的完整 data.npz 序列数量。
     source_positive_quota: int = 64                 # 一份缓存序列累计贡献该数量正样本后，尝试替换为新序列。
     positive_fraction: float = 0.25                 # 每个训练 batch 的可见正样本比例；默认近似正负 1:3。
@@ -63,8 +62,9 @@ class SimpleCNNConfig:
     counterfactual_negative_weight: float = 0.0     # 反事实负样本：从 background_only_packed 取同位置纯背景反事实负样本的相对权重
 
     # 训练与验证设置
-    batch_size_per_gpu: int = 32                    # 每张 GPU 每个 micro-batch 的局部块数量。
-    eval_batch_size_per_gpu: int = 64               # 每张 GPU 在验证、测试时一次前向的标准块数量。
+    batch_size_per_gpu: int = 32                    # 每张 GPU 每个 micro-batch 的局部块数量
+    eval_batch_size_per_gpu: int = 64                # 每张 GPU 在验证、测试时一次前向的标准块数量。
+    max_eval_batch_num: int = 128                   # 每个 rank 每次验证/测试最多随机有放回抽取的 batch 数；0 表示完整遍历固定网格
     validation_time_stride: int = 5                 # 固定验证网格在时间轴上的步进（帧）；最小可设为 1。
 
     # 网络结构（与 _doc/SimpleCNN.md 第 4 章一致）
@@ -106,28 +106,93 @@ class SimpleCNNConfig:
 
     def validate(self) -> None:
         """在启动训练前尽早报告配置错误。"""
+        finite_values = {
+            "train_fraction": self.train_fraction,
+            "val_fraction": self.val_fraction,
+            "test_fraction": self.test_fraction,
+            "positive_fraction": self.positive_fraction,
+            "standard_positive_fraction": self.standard_positive_fraction,
+            "negative_local_weight": self.negative_local_weight,
+            "negative_same_time_weight": self.negative_same_time_weight,
+            "negative_random_weight": self.negative_random_weight,
+            "counterfactual_negative_weight": self.counterfactual_negative_weight,
+            "dropout": self.dropout,
+            "max_speed_per_frame_m": self.max_speed_per_frame_m,
+            "lambda_q": self.lambda_q,
+            "lambda_line": self.lambda_line,
+            "huber_delta_bins": self.huber_delta_bins,
+            "learning_rate": self.learning_rate,
+            "min_learning_rate_ratio": self.min_learning_rate_ratio,
+            "warmup_ratio": self.warmup_ratio,
+            "weight_decay": self.weight_decay,
+            "adam_beta1": self.adam_beta1,
+            "adam_beta2": self.adam_beta2,
+            "adam_eps": self.adam_eps,
+            "grad_clip_norm": self.grad_clip_norm,
+        }
+        non_finite = [name for name, value in finite_values.items() if not math.isfinite(value)]
+        if non_finite:
+            raise ValueError(f"以下浮点配置必须为有限值：{non_finite}")
         if self.frames_per_window != 20:
             raise ValueError("SimpleCNN-v1 固定使用 20 帧输入。")
         if self.block_width_m != 10_000:
             raise ValueError("SimpleCNN-v1 固定使用 10000 m 距离块。")
+        if self.input_channels != 8:
+            raise ValueError("SimpleCNN-v1 固定使用 8 个距离重排通道。")
+        if self.range_bins < self.block_width_m:
+            raise ValueError("range_bins 不得小于 block_width_m。")
         if self.block_width_m % self.input_channels != 0:
             raise ValueError("距离块宽度必须能被重排通道数整除。")
         if self.spatial_step_m <= 0 or self.spatial_step_m > self.block_width_m:
             raise ValueError("spatial_step_m 必须位于 (0, block_width_m]。")
         if self.batch_size_per_gpu < 2:
             raise ValueError("batch_size_per_gpu 至少为 2，才能同时容纳正负样本。")
+        if self.eval_batch_size_per_gpu < 1:
+            raise ValueError("eval_batch_size_per_gpu 必须为正。")
+        if self.num_workers < 0:
+            raise ValueError("num_workers 必须为非负整数。")
         if not 0.0 < self.positive_fraction < 1.0:
             raise ValueError("positive_fraction 必须位于 (0, 1)。")
         if not 0.0 <= self.standard_positive_fraction <= 1.0:
             raise ValueError("standard_positive_fraction 必须位于 [0, 1]。")
+        if self.positive_margin_m < 0 or self.negative_guard_m < 0:
+            raise ValueError("正样本边界和负样本保护距离不得为负。")
+        if self.negative_local_span_m < 1:
+            raise ValueError("negative_local_span_m 必须为正。")
         if self.validation_time_stride < 1:
             raise ValueError("validation_time_stride 的最小值为 1。")
+        if self.max_eval_batch_num < 0:
+            raise ValueError("max_eval_batch_num 必须为非负整数；0 表示完整验证。")
         if self.total_optimizer_steps < 1 or self.gradient_accumulation_steps < 1:
             raise ValueError("训练步数和梯度累积步数必须为正。")
         if self.source_cache_size < 1 or self.source_positive_quota < 1:
             raise ValueError("source cache 和 source quota 必须为正。")
         if self.source_sample_limit < 0:
             raise ValueError("source_sample_limit 必须为非负整数；0 表示使用全部序列。")
+        if self.hidden_dim < 1:
+            raise ValueError("hidden_dim 必须为正。")
+        if not 0.0 <= self.dropout < 1.0:
+            raise ValueError("dropout 必须位于 [0, 1)。")
+        if self.max_speed_per_frame_m <= 0.0:
+            raise ValueError("max_speed_per_frame_m 必须为正。")
+        if self.lambda_q < 0.0 or self.lambda_line < 0.0 or self.lambda_q + self.lambda_line <= 0.0:
+            raise ValueError("损失权重必须非负，且至少一项为正。")
+        if self.learning_rate <= 0.0:
+            raise ValueError("learning_rate 必须为正。")
+        if not 0.0 <= self.min_learning_rate_ratio <= 1.0:
+            raise ValueError("min_learning_rate_ratio 必须位于 [0, 1]。")
+        if not 0.0 <= self.warmup_ratio < 1.0:
+            raise ValueError("warmup_ratio 必须位于 [0, 1)。")
+        if self.weight_decay < 0.0:
+            raise ValueError("weight_decay 不得为负。")
+        if not 0.0 < self.adam_beta1 < 1.0 or not 0.0 < self.adam_beta2 < 1.0:
+            raise ValueError("Adam beta 必须位于 (0, 1)。")
+        if self.adam_eps <= 0.0:
+            raise ValueError("adam_eps 必须为正。")
+        if min(self.log_interval_steps, self.eval_interval_steps, self.checkpoint_interval_steps) < 1:
+            raise ValueError("日志、验证和 checkpoint 间隔必须为正。")
+        if self.keep_last_checkpoints < 0:
+            raise ValueError("keep_last_checkpoints 不得为负。")
         if self.huber_delta_bins <= 0.0:
             raise ValueError("huber_delta_bins 必须为正。")
         if self.amp not in {"auto", "bf16", "fp16", "off"}:
@@ -136,14 +201,19 @@ class SimpleCNNConfig:
             raise ValueError("wandb_mode 仅支持 online、offline 或 disabled。")
         if self.packed_bitorder not in {"big", "little"}:
             raise ValueError("packed_bitorder 仅支持 big 或 little。")
-        weight_sum = (
-            self.negative_local_weight
-            + self.negative_same_time_weight
-            + self.negative_random_weight
-            + self.counterfactual_negative_weight
+        negative_weights = (
+            self.negative_local_weight,
+            self.negative_same_time_weight,
+            self.negative_random_weight,
+            self.counterfactual_negative_weight,
         )
+        if any(weight < 0.0 for weight in negative_weights):
+            raise ValueError("负样本来源权重不得为负。")
+        weight_sum = sum(negative_weights)
         if weight_sum <= 0.0:
             raise ValueError("至少一种负样本来源的权重必须为正。")
+        if not all(0.0 < fraction < 1.0 for fraction in (self.train_fraction, self.val_fraction, self.test_fraction)):
+            raise ValueError("train/val/test 三个比例必须分别位于 (0, 1)。")
         split_sum = self.train_fraction + self.val_fraction + self.test_fraction
         if abs(split_sum - 1.0) > 1e-8:
             raise ValueError("train/val/test 三个比例之和必须为 1。")
@@ -212,8 +282,9 @@ def load_profile(profile_name: str) -> SimpleCNNConfig:
 def load_config_json(path: Path) -> SimpleCNNConfig:
     """从已经落盘的 ``resolved_config.json`` 恢复配置。"""
     values = json.loads(path.read_text(encoding="utf-8"))
-    # 早期实验快照曾含有冗余的 wandb_enabled；现在统一由 wandb_mode 控制。
+    # 兼容删除冗余开关和第二套固定验证之前生成的实验快照。
     values.pop("wandb_enabled", None)
+    values.pop("best_eval_batch_num", None)
     path_keys = {"output_root", "data_root", "resume"}
     for key in path_keys:
         if values.get(key) is not None:
@@ -249,6 +320,12 @@ def parse_entrypoint_args(
     )
     parser.add_argument("--resume", type=Path, default=None if resume is None else Path(resume),
         help="要恢复的 last.pt checkpoint。",
+    )
+    parser.add_argument(
+        "--env-file",
+        type=Path,
+        default=None,
+        help="本地运行时 .env 路径；默认尝试 SimpleCNN/.env。",
     )
     parser.add_argument("--set", action="append", default=list(overrides or ()), metavar="KEY=VALUE",
         help="覆盖 profile 字段，可重复使用，例如 --set batch_size_per_gpu=16。",

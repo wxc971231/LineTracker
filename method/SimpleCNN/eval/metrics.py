@@ -24,9 +24,15 @@ METRIC_NAMES = (
 )
 
 
+def metric_accumulator_dtype(device: torch.device) -> torch.dtype:
+    """返回当前后端可用于指标累加和分布式归约的精度。"""
+    # HCCL 不支持 float64 all-reduce；CUDA/CPU 继续使用 float64 统计精度。
+    return torch.float32 if device.type == "npu" else torch.float64
+
+
 def empty_metric_totals(device: torch.device) -> torch.Tensor:
-    """创建顺序由 ``METRIC_NAMES`` 固定的 float64 累加器。"""
-    return torch.zeros(len(METRIC_NAMES), device=device, dtype=torch.float64)
+    """创建顺序由 ``METRIC_NAMES`` 固定的数值累加器。"""
+    return torch.zeros(len(METRIC_NAMES), device=device, dtype=metric_accumulator_dtype(device))
 
 
 def metrics_from_totals(totals: torch.Tensor, config: SimpleCNNConfig, prefix: str) -> dict[str, float]:

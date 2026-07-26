@@ -12,40 +12,59 @@
             "console": "integratedTerminal"
         },
         {
-            "name": "SimpleCNN：单卡 debug 训练",
+            "name": "SimpleCNN · CPU · debug",
             "type": "debugpy",
             "request": "launch",
-            "python": "/home/pc5090/Programmer/miniconda3/envs/linetracker-py311/bin/python",
-            "module": "torch.distributed.run",
-            "args": [
-                "--standalone",
-                "--nproc_per_node=1",
-                "train/train_ddp.py",
-                "--config",
-                "debug"
-            ],
+            "program": "${workspaceFolder}/method/SimpleCNN/train/train_ddp.py",
+            "args": ["--config", "debug", "--set", "wandb_mode=disabled"],
             "cwd": "${workspaceFolder}/method/SimpleCNN",
+            "envFile": "${workspaceFolder}/method/SimpleCNN/.env",
+            "env": {
+                "LT_ACCELERATOR": "cpu",
+                "LT_AMP": "off"
+            },
             "console": "integratedTerminal",
-            "justMyCode": false,
-            "subProcess": true
+            "justMyCode": false
         },
         {
-            "name": "SimpleCNN：单卡正式训练",
+            "name": "SimpleCNN · 单卡 debug · auto",
             "type": "debugpy",
             "request": "launch",
-            "python": "/home/pc5090/Programmer/miniconda3/envs/linetracker-py311/bin/python",
-            "module": "torch.distributed.run",
+            "program": "${workspaceFolder}/method/SimpleCNN/train/train_ddp.py",
+            "args": ["--config", "debug", "--set", "wandb_mode=disabled"],
+            "cwd": "${workspaceFolder}/method/SimpleCNN",
+            "envFile": "${workspaceFolder}/method/SimpleCNN/.env",
+            "env": {
+                "LT_ACCELERATOR": "auto",
+                "CUDA_VISIBLE_DEVICES": "0",
+                "ASCEND_RT_VISIBLE_DEVICES": "0"
+            },
+            "console": "integratedTerminal",
+            "justMyCode": false
+        },
+        {
+            "name": "SimpleCNN · 多卡正式训练 · auto",
+            "type": "debugpy",
+            "request": "launch",
+            "module": "runtime.launch",
             "args": [
-                "--standalone",
-                "--nproc_per_node=1",
                 "train/train_ddp.py",
                 "--config",
                 "simplecnn_v1"
             ],
             "cwd": "${workspaceFolder}/method/SimpleCNN",
+            "envFile": "${workspaceFolder}/method/SimpleCNN/.env",
+            "env": {
+                "LT_ACCELERATOR": "auto",
+                "CUDA_VISIBLE_DEVICES": "0,1,4,5",
+                "ASCEND_RT_VISIBLE_DEVICES": "0,1,2,3,4,5,14,15",
+                "HCCL_IF_BASE_PORT": "62000",
+                "OMP_NUM_THREADS": "1",
+                "ASCEND_GLOBAL_LOG_LEVEL": "3"
+            },
             "console": "integratedTerminal",
             "justMyCode": false,
-            "subProcess": true
+            "subProcess": false
         }
     ]
 }

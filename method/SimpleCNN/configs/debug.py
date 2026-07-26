@@ -8,7 +8,7 @@ from .base import SimpleCNNConfig
 def get_config() -> SimpleCNNConfig:
     """返回可快速完成冒烟训练的保守配置。"""
     return SimpleCNNConfig(
-        run_name="debug",               # 实验输出目录名，结果保存到 runs/debug/<时间戳>/。
+        run_name="debug",               # 实验系列名，结果保存到 runs/debug/<参数摘要>/<时间戳>/。
         batch_size_per_gpu=4,           # 每张 GPU 的训练 micro-batch 大小；设小以便快速检查。
         source_cache_size=2,            # 每个训练 worker 同时缓存的完整 .npz 序列数。
         source_positive_quota=8,        # 单份序列累计提供 8 个正样本后，尝试替换为新序列。

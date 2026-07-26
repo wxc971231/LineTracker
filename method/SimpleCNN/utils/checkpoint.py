@@ -24,8 +24,9 @@ def load_checkpoint(path: Path, device: torch.device) -> dict[str, Any]:
 
 def rotate_checkpoints(directory: Path, keep: int) -> None:
     """保留最近的若干 step checkpoint；last.pt 和 best.pt 不参与轮转。"""
-    if keep < 1:
-        return
+    if keep < 0:
+        raise ValueError("keep 不得为负。")
     paths = sorted(directory.glob("step_*.pt"), key=lambda item: item.stat().st_mtime)
-    for path in paths[:-keep]:
+    expired = paths if keep == 0 else paths[:-keep]
+    for path in expired:
         path.unlink(missing_ok=True)
