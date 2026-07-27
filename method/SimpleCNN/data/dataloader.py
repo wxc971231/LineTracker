@@ -125,7 +125,11 @@ def discover_sources(data_root: Path, source_sample_limit: int = 0) -> list[Sour
     """按生成器布局快速枚举一级序列目录，不逐个查询 ``data.npz``。"""
     records: list[SourceRecord] = []
     for source_dir in data_root.iterdir():
-        records.append(SourceRecord(source_id=source_dir.name, path=source_dir / "data.npz"))
+        data_path = source_dir / "data.npz"
+        # 生成目录中可能同时存在 batch_manifest.json 等说明文件；只接受真实序列目录。
+        if not source_dir.is_dir() or not data_path.is_file():
+            continue
+        records.append(SourceRecord(source_id=source_dir.name, path=data_path))
         if source_sample_limit > 0 and len(records) >= source_sample_limit:
             break
     if not records:
@@ -731,6 +735,63 @@ class DistributedSourceReplacementSampler(Sampler[int]):
         return self.num_batches * self.batch_size
 
 
+class DistributedSourceSubsetSampler(Sampler[int]):
+    """从 rank 所属网格块中无放回抽取有限子集，并保持 source-major 访问顺序。
+
+    每个 rank 仅处理 ``source_spans[rank::world_size]``，因此不同 rank 之间的
+    source 与样本天然不重叠。rank 内先均匀无放回选择至多 ``num_batches ×
+    batch_size`` 个块，再按 source-major 顺序产出，以减少 ``PackedSource`` 缓存
+    的频繁切换；排序只改变访问顺序，不改变被选子集的均匀性。
+    """
+
+    def __init__(
+        self,
+        source_spans: Sequence[tuple[int, int]],
+        num_batches: int,
+        batch_size: int,
+        rank: int,
+        world_size: int,
+        seed: int,
+    ) -> None:
+        if num_batches < 1 or batch_size < 1:
+            raise ValueError("无放回评估采样的 batch 数和 batch size 必须为正。")
+        if world_size < 1 or not 0 <= rank < world_size:
+            raise ValueError(f"无效 DDP 身份：rank={rank}, world_size={world_size}。")
+        self.source_spans = tuple(source_spans[rank::world_size])
+        self.max_sample_count = int(num_batches) * int(batch_size)
+        self.rank = int(rank)
+        self.seed = int(seed)
+        self._evaluation_index = 0
+
+    def __iter__(self) -> Iterator[int]:
+        if not self.source_spans:
+            return
+        starts = np.asarray([start for start, _ in self.source_spans], dtype=np.int64)
+        lengths = np.asarray([stop - start for start, stop in self.source_spans], dtype=np.int64)
+        cumulative_lengths = np.cumsum(lengths, dtype=np.int64)
+        total_sample_count = int(cumulative_lengths[-1])
+        selected_count = min(self.max_sample_count, total_sample_count)
+        evaluation_seed = (
+            self.seed
+            + self.rank * 10_000_019
+            + self._evaluation_index * 1_000_000_007
+        ) % (2**63 - 1)
+        self._evaluation_index += 1
+        rng = np.random.default_rng(evaluation_seed)
+
+        # 在 rank 的全部块上均匀无放回选子集；升序输出时同一 source 会连续访问。
+        selected_offsets = np.sort(
+            rng.choice(total_sample_count, size=selected_count, replace=False).astype(np.int64, copy=False)
+        )
+        source_slots = np.searchsorted(cumulative_lengths, selected_offsets, side="right")
+        preceding_lengths = np.concatenate((np.zeros(1, dtype=np.int64), cumulative_lengths[:-1]))
+        sample_indices = starts[source_slots] + selected_offsets - preceding_lengths[source_slots]
+        yield from sample_indices.tolist()
+
+    def __len__(self) -> int:
+        return min(self.max_sample_count, sum(stop - start for start, stop in self.source_spans))
+
+
 class StandardGridDataset(Dataset[dict[str, torch.Tensor]]):
     """从固定验证/测试清单恢复标准网格块，不做任何随机裁剪。"""
 
@@ -1229,8 +1290,8 @@ def _grid_cache_path(
     config: SimpleCNNConfig,
 ) -> Path:
     """由全部会改变网格划分的设置和 source 身份生成缓存路径。"""
-    if split_name not in {"val", "test"}:
-        raise ValueError(f"grid 缓存 split 应为 val 或 test，实际为 {split_name!r}。")
+    if split_name not in {"val", "test", "eval"}:
+        raise ValueError(f"grid 缓存 split 应为 val、test 或 eval，实际为 {split_name!r}。")
 
     relative_paths = _record_relative_paths(records, config.data_root)
     signatures = _record_file_signatures(records)
@@ -1380,6 +1441,17 @@ def prepare_evaluation_manifest(
     return _build_or_load_grid_cache(split_name, splits[split_name], config)
 
 
+def prepare_fixed_evaluation_manifest(config: SimpleCNNConfig) -> Path:
+    """为 ``config.data_root`` 下全部有效序列创建或复用完整评估网格。
+
+    与 ``prepare_evaluation_manifest`` 不同，本函数不读取、创建或依赖
+    train/val/test 划分：数据根目录下每个含 ``data.npz`` 的一级子目录都会
+    进入评估。调用方应将 ``max_eval_batch_num`` 设为 0，以完整遍历该网格。
+    """
+    records = discover_sources(config.data_root, source_sample_limit=0)
+    return _build_or_load_grid_cache("eval", records, config)
+
+
 def _split_records_for_rank(
     records: Sequence[SourceRecord], rank: int, world_size: int
 ) -> tuple[SourceRecord, ...]:
@@ -1433,8 +1505,13 @@ def build_validation_dataloader(
     max_eval_batches: int | None = None,
     dataset: StandardGridDataset | None = None,
     num_workers: int | None = None,
+    without_replacement: bool = False,
 ) -> DataLoader[dict[str, torch.Tensor]]:
-    """构造固定标准网格验证/测试数据加载器，不填充 DDP 尾部样本。"""
+    """构造固定标准网格验证/测试数据加载器，不填充 DDP 尾部样本。
+
+    ``without_replacement`` 仅在 ``max_eval_batches>0`` 时生效：训练中的限量
+    validation 继续沿用有放回采样；独立 eval 可显式启用无放回子集采样。
+    """
     if dataset is None:
         verify_cached_samples = rank == 0 and manifest_path.parent.resolve() == GRID_CACHE_DIR.resolve()
         dataset = StandardGridDataset(
@@ -1453,6 +1530,15 @@ def build_validation_dataloader(
             dataset.source_spans,
             rank=rank,
             world_size=world_size,
+        )
+    elif without_replacement:
+        sampler = DistributedSourceSubsetSampler(
+            dataset.source_spans,
+            effective_max_batches,
+            config.eval_batch_size_per_gpu,
+            rank=rank,
+            world_size=world_size,
+            seed=config.seed,
         )
     else:
         sampler = DistributedSourceReplacementSampler(

@@ -68,20 +68,23 @@ torchrun --standalone --nproc_per_node=1 train/train_ddp.py \
 
 `cfg` 哈希覆盖模型、采样、损失、优化器、训练预算和验证协议等配置，但排除本机数据/输出路径、resume、W&B 和纯 I/O 设置。这样路径保持可读，同时任何未展示的关键算法参数变化仍会得到不同目录。恢复历史 checkpoint 时始终沿用其原 run 目录。W&B 运行名称采用相同摘要加时间戳。
 
-验证和测试网格统一缓存在 `runs/_cache/val_test_grid/`，cache key 包含数据划分、网格参数及源文件大小/mtime。
+验证、测试和全量独立评估网格统一缓存在 `runs/_cache/val_test_grid/`，cache key 包含数据划分/评估集合、网格参数及源文件大小/mtime。
 
 训练启动只按需构建 validation cache；test cache 在独立评估首次使用时构建。完整评估按 source 分配给不同 rank。限量评估由 `max_eval_batch_num` 控制，每次验证都会有放回重新采样；同一次 `val` 的指标同时写入 W&B 并用于更新 `best.pt`。一个 batch 只访问一个 source，以减少完整序列反复解压。
 
 ## 独立评估
 
 ```bash
-torchrun --standalone --nproc_per_node=4 eval/evaluate.py \
-  --run-dir runs/simplecnn_v1/<experiment_slug>/<timestamp> \
-  --split test \
-  --full-eval
+torchrun --standalone --nproc_per_node=4 eval/eval_ddp.py \
+  --eval-data-root /path/to/synthetic/gen/<dataset_name> \
+  --eval-batch-size-per-gpu 512 \
+  --max-eval-batch-num 200 \
+  --time-stride 5
 ```
 
-`--full-eval` 会完整遍历所选 split；去掉该参数时，按 `resolved_config.json` 中的 `max_eval_batch_num` 执行有放回限量抽样。
+评估集合始终为 `--eval-data-root` 下所有含 `data.npz` 的一级样本目录，不读取训练时的 train/val/test 划分。`--eval-batch-size-per-gpu` 仅控制每张卡的前向批大小。`--max-eval-batch-num` 为每个 DDP rank 的最大 batch 数，正数时从该 rank 分到的全部网格块中无放回随机抽样；不同 rank 分到的 source 本就不重叠，因此全局也不会重复计数同一个块。多卡合计理论最多为 `world_size × max_eval_batch_num` 个 batch。将其设为 `0` 才会按 source 分片完整遍历全量网格。`--time-stride=1` 可覆盖全部可行的 20 帧时间窗起点，较大的值则按固定步进抽取窗口。
+
+评估结束后仅由 rank 0 将最终 all-reduce 指标写入 `<checkpoint 的上级运行目录>/eval/eval_<时间戳>.json`；该 JSON 同时记录 checkpoint、数据根目录、网格规模、采样参数、DDP 信息与全部指标。
 
 ## 恢复训练
 

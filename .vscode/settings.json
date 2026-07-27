@@ -1,5 +1,4 @@
 {
-    "terminal.integrated.cwd": "/mnt/host-model/weixc/code/LineTracker",
     "python-envs.defaultEnvManager": "ms-python.python:conda",
     "python-envs.defaultPackageManager": "ms-python.python:conda"
 }
