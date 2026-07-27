@@ -65,7 +65,7 @@ def algorithm_config_digest(config: SimpleCNNConfig, length: int = 8) -> str:
 
 
 def build_experiment_slug(config: SimpleCNNConfig, world_size: int) -> str:
-    """组合数据上限、全局 batch、验证预算和完整配置短哈希。"""
+    """组合数据上限、全局 batch、模型容量和完整配置短哈希。"""
     if world_size < 1:
         raise ValueError("world_size 必须为正整数。")
     global_batch_size = (
@@ -78,20 +78,11 @@ def build_experiment_slug(config: SimpleCNNConfig, world_size: int) -> str:
         if config.source_sample_limit == 0
         else _compact_count(config.source_sample_limit)
     )
-    eval_budget = (
-        "full"
-        if config.max_eval_batch_num == 0
-        else str(
-            config.eval_batch_size_per_gpu
-            * config.max_eval_batch_num
-            * world_size
-        )
-    )
     return (
         f"limit{source_limit}-gbs{global_batch_size}"
         f"-lr{_scientific_token(config.learning_rate)}"
         f"-pos{_decimal_token(config.positive_fraction * 100.0)}"
-        f"-vs{config.validation_time_stride}-eval{eval_budget}"
+        f"-vs{config.validation_time_stride}-model{config.model_type}"
         f"-cfg{algorithm_config_digest(config)}"
     )
 

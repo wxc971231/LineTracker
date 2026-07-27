@@ -43,20 +43,20 @@ class RunNamingTests(unittest.TestCase):
 
         self.assertRegex(
             slug,
-            r"^limit10k-gbs512-lr3e-4-pos25-vs5-eval262144-cfg[0-9a-f]{8}$",
+            r"^limit10k-gbs512-lr3e-4-pos25-vs5-modeln-cfg[0-9a-f]{8}$",
         )
 
-    def test_world_size_and_full_eval_change_readable_summary(self) -> None:
+    def test_world_size_and_model_type_change_readable_summary(self) -> None:
         four_device = build_experiment_slug(self.config, world_size=4)
-        full_eval = build_experiment_slug(
-            replace(self.config, source_sample_limit=0, max_eval_batch_num=0),
+        all_sources_s = build_experiment_slug(
+            replace(self.config, source_sample_limit=0, model_type="s"),
             world_size=8,
         )
 
         self.assertIn("-gbs256-", four_device)
-        self.assertIn("-eval131072-", four_device)
-        self.assertIn("limitall-gbs512", full_eval)
-        self.assertIn("-evalfull-", full_eval)
+        self.assertNotIn("-eval", four_device)
+        self.assertIn("limitall-gbs512", all_sources_s)
+        self.assertIn("-models-", all_sources_s)
 
     def test_digest_ignores_machine_and_logging_only_fields(self) -> None:
         changed_runtime = replace(
@@ -81,11 +81,16 @@ class RunNamingTests(unittest.TestCase):
         )
 
     def test_digest_changes_with_algorithm_setting(self) -> None:
-        changed_model = replace(self.config, hidden_dim=self.config.hidden_dim * 2)
+        changed_hidden_dim = replace(self.config, hidden_dim=self.config.hidden_dim * 2)
+        changed_model_type = replace(self.config, model_type="s")
 
         self.assertNotEqual(
             algorithm_config_digest(self.config),
-            algorithm_config_digest(changed_model),
+            algorithm_config_digest(changed_hidden_dim),
+        )
+        self.assertNotEqual(
+            algorithm_config_digest(self.config),
+            algorithm_config_digest(changed_model_type),
         )
 
     def test_new_run_directory_and_legacy_wandb_name(self) -> None:

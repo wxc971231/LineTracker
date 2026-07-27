@@ -68,9 +68,15 @@ if __name__ == "__main__":
     """准备 DDP、固定数据清单、W&B 并启动按 step 的训练。"""
 
     # 入口参数，可被命令行覆盖
+    # resume_ckpt = Path(
+    #     "/mnt/host-model/weixc/code/LineTracker/method/SimpleCNN/runs/simplecnn_v1/"
+    #     "limit50k-gbs1024-lr5e-4-pos25-vs5-modeln-cfgc267d7ac/"
+    #     "20260726_195844/checkpoints/last.pt"
+    # )
+    resume_ckpt = None 
     args = parse_entrypoint_args(
         config="simplecnn_v1",      # configs 下的 profile 名称
-        resume=None,                # 要恢复的 last.pt checkpoint 路径
+        resume=resume_ckpt,             
         overrides=(),               # 需要覆盖的参数字段，如 ("batch_size_per_gpu=16",)。
     )
 
