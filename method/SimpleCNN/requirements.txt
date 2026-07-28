@@ -1,5 +1,8 @@
 numpy>=1.26
+matplotlib>=3.8
+pandas>=2.1
 # PyTorch 必须按平台单独安装；Ascend 还需安装与之匹配的 torch_npu。
 # 不在通用 requirements 中声明 torch，避免 pip 覆盖 CUDA/Ascend 厂商版本。
 wandb>=0.17
 tqdm>=4.66
+setproctitle>=1.3

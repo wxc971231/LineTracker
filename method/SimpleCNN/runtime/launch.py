@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import argparse
 from collections.abc import Sequence
+from pathlib import Path
 
 from runtime.settings import load_runtime_settings
+from utils.process_title import ensure_process_job_id, set_process_title
 
 
 def _visible_accelerator_count(requested: str) -> int:
@@ -38,9 +40,30 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
+def _option_value(arguments: Sequence[str], option: str) -> str | None:
+    """同时识别 ``--option value`` 和 ``--option=value``。"""
+    for index, argument in enumerate(arguments):
+        if argument == option and index + 1 < len(arguments):
+            return arguments[index + 1]
+        prefix = f"{option}="
+        if argument.startswith(prefix):
+            return argument[len(prefix):]
+    return None
+
+
 def main(argv: Sequence[str] | None = None) -> None:
     """按 CUDA_VISIBLE_DEVICES 或 ASCEND_RT_VISIBLE_DEVICES 派生 nproc。"""
     args = parse_args(argv)
+    script_stem = Path(args.training_script).stem
+    mode = "eval" if "eval" in script_stem else "train"
+    label = _option_value(args.training_args, "--config") or mode
+    job_id = ensure_process_job_id()
+    set_process_title(
+        f"{mode}-launch",
+        label=label,
+        job_id=job_id,
+        infer_rank=False,
+    )
     settings = load_runtime_settings()
     nproc_per_node = _visible_accelerator_count(settings.accelerator)
     if nproc_per_node < 1:  # pragma: no cover - 后端可用时应至少暴露一张卡。

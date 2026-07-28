@@ -56,10 +56,10 @@ class SimpleCNNConfig:
     positive_margin_m: int = 100                    # 正样本目标轨迹与块距离边界至少间隔的距离宽度（m）。
     negative_guard_m: int = 100                     # 普通负样本块与目标轨迹至少间隔的距离宽度（m）。
     negative_local_span_m: int = 3_000              # 局部困难负样本在可行区间内、贴近轨迹一侧的抽样跨度（m）。
-    negative_local_weight: float = 1.0 / 3.0        # 局部困难负样本：同时间窗内，找到与目标轨迹至少相隔 negative_guard_m 的距离块，向远离轨迹方向随机偏移最多 negative_local_span_m
-    negative_same_time_weight: float = 1.0 / 3.0    # 局部分层负样本：同时间窗内，距离安全区间中，先随机采样中心距离区间 [0,10), [10,50), [50,300)，再在距离区间内随机抽取负样本块
-    negative_random_weight: float = 1.0 / 3.0       # 随机负样本：从随机序列、随机时间和随机距离采样负样本
-    counterfactual_negative_weight: float = 0.0     # 反事实负样本：从 background_only_packed 取同位置纯背景反事实负样本的相对权重
+    negative_local_weight: float = 1.0              # 局部困难负样本：同时间窗内，找到与目标轨迹至少相隔 negative_guard_m 的距离块，向远离轨迹方向随机偏移最多 negative_local_span_m
+    negative_same_time_weight: float = 1.0          # 局部分层负样本：同时间窗内，距离安全区间中，先随机采样中心距离区间 [0,10), [10,50), [50,300)，再在距离区间内随机抽取负样本块
+    negative_random_weight: float = 1.0             # 随机负样本：从随机序列、随机时间和随机距离采样负样本
+    negative_partial_weight: float = 1.0            # 部分相交负样本：潜在轨迹与块相交但被边界截断，以 q*=0 监督置信度头。
 
     # 训练与验证设置
     batch_size_per_gpu: int = 32                    # 每张 GPU 每个 micro-batch 的局部块数量
@@ -78,6 +78,7 @@ class SimpleCNNConfig:
     lambda_q: float = 1.0                           # 质量头 BCE 损失在总损失中的权重。
     lambda_line: float = 1.0                        # 逐帧响应距离 Huber 几何损失在总损失中的权重。
     huber_delta_bins: float = 3.0                   # Huber 二次段切换到线性段的阈值（bin，即 m）。
+    line_loss_scale: float = 5_000.0                # 几何 Huber 损失的固定缩放除数；输出和物理评估仍使用 m/bin。
 
     # 优化器和按 step 调度
     total_optimizer_steps: int = 50_000             # 训练总 optimizer 更新次数；无限在线数据流不按 epoch 停止。
@@ -116,12 +117,13 @@ class SimpleCNNConfig:
             "negative_local_weight": self.negative_local_weight,
             "negative_same_time_weight": self.negative_same_time_weight,
             "negative_random_weight": self.negative_random_weight,
-            "counterfactual_negative_weight": self.counterfactual_negative_weight,
+            "negative_partial_weight": self.negative_partial_weight,
             "dropout": self.dropout,
             "max_speed_per_frame_m": self.max_speed_per_frame_m,
             "lambda_q": self.lambda_q,
             "lambda_line": self.lambda_line,
             "huber_delta_bins": self.huber_delta_bins,
+            "line_loss_scale": self.line_loss_scale,
             "learning_rate": self.learning_rate,
             "min_learning_rate_ratio": self.min_learning_rate_ratio,
             "warmup_ratio": self.warmup_ratio,
@@ -198,6 +200,8 @@ class SimpleCNNConfig:
             raise ValueError("keep_last_checkpoints 不得为负。")
         if self.huber_delta_bins <= 0.0:
             raise ValueError("huber_delta_bins 必须为正。")
+        if self.line_loss_scale <= 0.0:
+            raise ValueError("line_loss_scale 必须为正。")
         if self.amp not in {"auto", "bf16", "fp16", "off"}:
             raise ValueError("amp 仅支持 auto、bf16、fp16 或 off。")
         if self.wandb_mode not in {"online", "offline", "disabled"}:
@@ -208,7 +212,7 @@ class SimpleCNNConfig:
             self.negative_local_weight,
             self.negative_same_time_weight,
             self.negative_random_weight,
-            self.counterfactual_negative_weight,
+            self.negative_partial_weight,
         )
         if any(weight < 0.0 for weight in negative_weights):
             raise ValueError("负样本来源权重不得为负。")
@@ -285,9 +289,12 @@ def load_profile(profile_name: str) -> SimpleCNNConfig:
 def load_config_json(path: Path) -> SimpleCNNConfig:
     """从已经落盘的 ``resolved_config.json`` 恢复配置。"""
     values = json.loads(path.read_text(encoding="utf-8"))
-    # 兼容删除冗余开关和第二套固定验证之前生成的实验快照。
+    # world_size 是运行快照元数据；恢复时始终使用当前启动环境的值。
+    values.pop("world_size", None)
+    # 兼容历史版本中已经删除的配置字段。
     values.pop("wandb_enabled", None)
     values.pop("best_eval_batch_num", None)
+    values.pop("counterfactual_negative_weight", None)
     path_keys = {"output_root", "data_root", "resume"}
     for key in path_keys:
         if values.get(key) is not None:
@@ -297,11 +304,15 @@ def load_config_json(path: Path) -> SimpleCNNConfig:
     return config
 
 
-def save_config_json(config: SimpleCNNConfig, path: Path) -> None:
-    """保存解析后的完整配置，便于恢复和可复现实验。"""
+def save_config_json(config: SimpleCNNConfig, path: Path, *, world_size: int) -> None:
+    """保存解析后的完整配置及本次启动的分布式规模。"""
+    if world_size < 1:
+        raise ValueError("world_size 必须为正整数。")
+    snapshot = config.as_serializable_dict()
+    snapshot["world_size"] = int(world_size)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(
-        json.dumps(config.as_serializable_dict(), ensure_ascii=False, indent=2),
+        json.dumps(snapshot, ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
 

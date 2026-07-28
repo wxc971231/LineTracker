@@ -15,6 +15,7 @@ _CONFIG_DIGEST_EXCLUDED_FIELDS = {
     "output_root",
     "data_root",
     "resume",
+    "num_workers",
     "pin_memory",
     "log_interval_steps",
     "checkpoint_interval_steps",
@@ -54,6 +55,20 @@ def algorithm_config_digest(config: SimpleCNNConfig, length: int = 8) -> str:
         for key, value in values.items()
         if key not in _CONFIG_DIGEST_EXCLUDED_FIELDS
     }
+    negative_weight_names = (
+        "negative_local_weight",
+        "negative_same_time_weight",
+        "negative_random_weight",
+        "negative_partial_weight",
+    )
+    negative_weight_sum = sum(
+        float(algorithm_values[name]) for name in negative_weight_names
+    )
+    if negative_weight_sum > 0.0:
+        for name in negative_weight_names:
+            algorithm_values[name] = (
+                float(algorithm_values[name]) / negative_weight_sum
+            )
     payload = json.dumps(
         algorithm_values,
         ensure_ascii=False,

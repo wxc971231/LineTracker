@@ -22,14 +22,16 @@ import torch
 from torch.utils.data import DataLoader, Dataset, IterableDataset, Sampler, get_worker_info
 
 from configs.base import SimpleCNNConfig
+from utils.process_title import set_process_title
 from utils.seed import worker_seed
 
 
 _GRID_CACHE_SAMPLE_CHECK_COUNT = 10
 GRID_CACHE_DIR = Path(__file__).resolve().parents[1] / "runs" / "_cache" / "val_test_grid"
-_GRID_CACHE_SCHEMA_VERSION = 2
+_GRID_CACHE_SCHEMA_VERSION = 3
 _GRID_CACHE_REQUIRED_FIELDS = frozenset(
     {
+        "schema_version",
         "source_ids",
         "source_relative_paths",
         "source_index",
@@ -40,8 +42,19 @@ _GRID_CACHE_REQUIRED_FIELDS = frozenset(
         "response_mask",
         "response_bin",
         "is_positive",
+        "q_valid",
     }
 )
+
+
+def _initialize_train_worker_process(worker_id: int) -> None:
+    """区分在线训练 DataLoader worker 与持有 NPU/CUDA 的 rank 进程。"""
+    set_process_title("train-data", worker_id=worker_id)
+
+
+def _initialize_eval_worker_process(worker_id: int) -> None:
+    """区分验证/测试 DataLoader worker 与持有 NPU/CUDA 的 rank 进程。"""
+    set_process_title("eval-data", worker_id=worker_id)
 
 
 def _read_npz_array_header(
@@ -74,6 +87,7 @@ def _grid_cache_headers_are_valid(
             "response_mask",
             "response_bin",
             "is_positive",
+            "q_valid",
         )
     }
     source_index_shape, source_index_dtype = headers["source_index"]
@@ -87,6 +101,7 @@ def _grid_cache_headers_are_valid(
         "response_mask": (sample_count, config.frames_per_window),
         "response_bin": (sample_count, config.frames_per_window),
         "is_positive": (sample_count,),
+        "q_valid": (sample_count,),
     }
     if any(headers[name][0] != shape for name, shape in expected_shapes.items()):
         return False
@@ -97,7 +112,7 @@ def _grid_cache_headers_are_valid(
         return False
     return all(
         headers[name][1] == np.dtype(np.bool_)
-        for name in ("response_mask", "is_positive")
+        for name in ("response_mask", "is_positive", "q_valid")
     )
 
 
@@ -122,16 +137,19 @@ class DataArtifacts:
 
 
 def discover_sources(data_root: Path, source_sample_limit: int = 0) -> list[SourceRecord]:
-    """按生成器布局快速枚举一级序列目录，不逐个查询 ``data.npz``。"""
+    """按生成器布局枚举一级序列目录，不查询每个 ``data.npz``。"""
     records: list[SourceRecord] = []
-    for source_dir in data_root.iterdir():
-        data_path = source_dir / "data.npz"
-        # 生成目录中可能同时存在 batch_manifest.json 等说明文件；只接受真实序列目录。
-        if not source_dir.is_dir() or not data_path.is_file():
-            continue
-        records.append(SourceRecord(source_id=source_dir.name, path=data_path))
-        if source_sample_limit > 0 and len(records) >= source_sample_limit:
-            break
+    with os.scandir(data_root) as entries:
+        for entry in entries:
+            # DirEntry 通常直接使用目录项类型，不对 data.npz 发起额外 stat。
+            if not entry.is_dir():
+                continue
+            source_dir = Path(entry.path)
+            records.append(
+                SourceRecord(source_id=entry.name, path=source_dir / "data.npz")
+            )
+            if source_sample_limit > 0 and len(records) >= source_sample_limit:
+                break
     if not records:
         raise FileNotFoundError(f"在 {data_root} 下没有找到任何序列目录。")
     return records
@@ -167,9 +185,8 @@ class PackedSource:
         "target_true_range_m",
     }
 
-    def __init__(self, record: SourceRecord) -> None:
+    def __init__(self, record: SourceRecord, config: SimpleCNNConfig) -> None:
         self.record = record
-        self._background_only_packed: np.ndarray | None = None
         with np.load(record.path, allow_pickle=False) as archive:
             missing = self.REQUIRED_FIELDS.difference(archive.files)
             if missing:
@@ -179,29 +196,33 @@ class PackedSource:
             self.target_hit_bin = archive["target_hit_bin"].astype(np.int32, copy=False)
             self.target_true_range_m = archive["target_true_range_m"].astype(np.float32, copy=False)
 
+        if self.observation_packed.ndim != 2:
+            raise ValueError(
+                f"{record.path} 的 observation_packed 应为二维数组，"
+                f"实际形状为 {self.observation_packed.shape}。"
+            )
         self.frames = int(self.observation_packed.shape[0])
-        self.range_bins = int(self.observation_packed.shape[1] * 8)
-        if not (
-            self.target_hit.shape == self.target_hit_bin.shape == self.target_true_range_m.shape == (self.frames,)
-        ):
-            raise ValueError(f"{record.path} 的目标标签形状与帧数不一致。")
-
-    def _load_background_only(self) -> np.ndarray:
-        """仅在需要反事实负样本时延迟读取背景矩阵。"""
-        if self._background_only_packed is None:
-            with np.load(self.record.path, allow_pickle=False) as archive:
-                if "background_only_packed" not in archive.files:
-                    raise KeyError(f"{self.record.path} 不含 background_only_packed。")
-                self._background_only_packed = archive["background_only_packed"].astype(np.uint8, copy=False)
-        return self._background_only_packed
+        expected_packed_bins = math.ceil(config.range_bins / 8)
+        if self.observation_packed.shape[1] != expected_packed_bins:
+            raise ValueError(
+                f"{record.path} 的 observation_packed 距离宽度为 "
+                f"{self.observation_packed.shape[1]} byte，当前配置 range_bins="
+                f"{config.range_bins} 需要 {expected_packed_bins} byte。"
+            )
+        _validate_target_arrays(
+            record.path,
+            self.target_hit,
+            self.target_hit_bin,
+            self.target_true_range_m,
+            self.frames,
+            config,
+        )
 
     def extract_window(
         self,
         time_start: int,
         range_start: int,
         config: SimpleCNNConfig,
-        *,
-        background_only: bool = False,
     ) -> np.ndarray:
         """局部解包出 ``[20, 10000]`` 原始二值窗口。
 
@@ -215,11 +236,13 @@ class PackedSource:
         if not 0 <= range_start <= config.range_bins - width:
             raise IndexError("距离窗起点越界。")
 
-        packed = self._load_background_only() if background_only else self.observation_packed
         first_byte = range_start // 8
         bit_offset = range_start % 8
         byte_count = math.ceil((bit_offset + width) / 8)
-        byte_window = packed[time_start : time_start + frames, first_byte : first_byte + byte_count]
+        byte_window = self.observation_packed[
+            time_start : time_start + frames,
+            first_byte : first_byte + byte_count,
+        ]
         unpacked = np.unpackbits(byte_window, axis=1, bitorder=config.packed_bitorder)
         return unpacked[:, bit_offset : bit_offset + width].astype(np.uint8, copy=False)
 
@@ -233,7 +256,7 @@ class LabelSource:
         "target_true_range_m",
     }
 
-    def __init__(self, record: SourceRecord) -> None:
+    def __init__(self, record: SourceRecord, config: SimpleCNNConfig) -> None:
         self.record = record
         with np.load(record.path, allow_pickle=False) as archive:
             missing = self.REQUIRED_FIELDS.difference(archive.files)
@@ -244,10 +267,51 @@ class LabelSource:
             self.target_true_range_m = archive["target_true_range_m"].astype(np.float32, copy=False)
 
         self.frames = int(self.target_hit.shape[0])
-        if not (
-            self.target_hit_bin.shape == self.target_true_range_m.shape == (self.frames,)
-        ):
-            raise ValueError(f"{record.path} 的目标标签形状与帧数不一致。")
+        _validate_target_arrays(
+            record.path,
+            self.target_hit,
+            self.target_hit_bin,
+            self.target_true_range_m,
+            self.frames,
+            config,
+        )
+
+
+def _validate_target_arrays(
+    path: Path,
+    target_hit: np.ndarray,
+    target_hit_bin: np.ndarray,
+    target_true_range_m: np.ndarray,
+    frames: int,
+    config: SimpleCNNConfig,
+) -> None:
+    """提前校验标签形状及其与当前数据配置的范围契约。"""
+    expected_shape = (frames,)
+    if not (
+        target_hit.shape
+        == target_hit_bin.shape
+        == target_true_range_m.shape
+        == expected_shape
+    ):
+        raise ValueError(f"{path} 的目标标签形状与帧数不一致。")
+    if frames < config.frames_per_window:
+        raise ValueError(
+            f"{path} 仅有 {frames} 帧，不足当前窗口长度 "
+            f"frames_per_window={config.frames_per_window}。"
+        )
+    if not np.all(np.isfinite(target_true_range_m)):
+        raise ValueError(f"{path} 的 target_true_range_m 含非有限值。")
+    if np.any(target_true_range_m < 0) or np.any(
+        target_true_range_m >= config.range_bins
+    ):
+        raise ValueError(
+            f"{path} 的 target_true_range_m 超出 [0, {config.range_bins})。"
+        )
+    visible_bins = target_hit_bin[target_hit]
+    if np.any(visible_bins < 0) or np.any(visible_bins >= config.range_bins):
+        raise ValueError(
+            f"{path} 的可见 target_hit_bin 超出 [0, {config.range_bins})。"
+        )
 
 
 def rearrange_distance_channels(window: np.ndarray, config: SimpleCNNConfig) -> np.ndarray:
@@ -280,32 +344,30 @@ def build_target_labels(
     time_start: int,
     range_start: int,
     config: SimpleCNNConfig,
-    *,
-    force_background: bool = False,
 ) -> dict[str, Any]:
-    """生成与文档一致的 $I_\tau,d_\tau,H,q^*,m_{line}$ 标签。"""
+    """生成二值置信度、置信度监督掩码与逐帧几何标签。"""
     frames = config.frames_per_window
     range_stop = range_start + config.block_width_m
     is_full, is_intersecting, _, _ = _trajectory_relation(source, time_start, range_start, config)
 
     response_mask = np.zeros(frames, dtype=np.bool_)
     response_bin = np.full(frames, -1, dtype=np.int64)
-    if not force_background:
-        hit = source.target_hit[time_start : time_start + frames]
-        hit_bin = source.target_hit_bin[time_start : time_start + frames]
-        inside = hit & (hit_bin >= range_start) & (hit_bin < range_stop)
-        response_mask[inside] = True
-        response_bin[inside] = hit_bin[inside].astype(np.int64) - int(range_start)
+    hit = source.target_hit[time_start : time_start + frames]
+    hit_bin = source.target_hit_bin[time_start : time_start + frames]
+    inside = hit & (hit_bin >= range_start) & (hit_bin < range_stop)
+    response_mask[inside] = True
+    response_bin[inside] = hit_bin[inside].astype(np.int64) - int(range_start)
 
     hit_count = int(response_mask.sum())
     track_relation = 1 if is_full else (2 if is_intersecting else 0)
+    is_visible_positive = bool(is_full and hit_count > 0)
     return {
         "I": response_mask,
         "d": response_bin,
         "H": hit_count,
-        "q": np.float32(hit_count / frames),
-        "m_line": bool(is_full and hit_count > 0 and not force_background),
-        "is_positive": bool(is_full and hit_count > 0 and not force_background),
+        "q": np.float32(is_visible_positive),
+        "q_valid": bool(not (is_full and hit_count == 0)),
+        "is_positive": is_visible_positive,         # 是否为完整可见正样本，用于监督几何损失
         "track_relation": np.int8(track_relation),  # 0=背景，1=完整，2=部分相交
     }
 
@@ -316,42 +378,30 @@ def _sample_to_numpy(
     range_start: int,
     config: SimpleCNNConfig,
     *,
-    background_only: bool = False,
     labels: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """提取原始窗口、重排并附加标签，形成一个局部块样本。"""
     if labels is None:
-        labels = build_target_labels(
-            source,
-            time_start,
-            range_start,
-            config,
-            force_background=background_only,
-        )
-    raw_window = source.extract_window(
-        time_start,
-        range_start,
-        config,
-        background_only=background_only,
-    )
+        labels = build_target_labels(source, time_start, range_start, config)
+    raw_window = source.extract_window(time_start, range_start, config)
     return {
         "x": rearrange_distance_channels(raw_window, config),
         "I": labels["I"],
         "d": labels["d"],
         "q": labels["q"],
-        "m_line": labels["m_line"],
         "is_positive": labels["is_positive"],
+        "q_valid": labels["q_valid"],
     }
 
 
 def _negative_labels(config: SimpleCNNConfig) -> dict[str, Any]:
-    """直接构造普通与反事实负样本共用的零标签。"""
+    """直接构造与潜在轨迹完全不相交的背景负样本标签。"""
     return {
         "I": np.zeros(config.frames_per_window, dtype=np.bool_),
         "d": np.full(config.frames_per_window, -1, dtype=np.int64),
         "q": np.float32(0.0),
-        "m_line": False,
         "is_positive": False,
+        "q_valid": True,
     }
 
 
@@ -383,7 +433,9 @@ class _SourcePool:
         self.entries: list[_CacheEntry] = []
         self._reshuffle_order()
         for _ in range(min(config.source_cache_size, len(self.records))):
-            self.entries.append(_CacheEntry(PackedSource(self._next_record(set()))))
+            self.entries.append(
+                _CacheEntry(PackedSource(self._next_record(set()), config))
+            )
 
     def _reshuffle_order(self) -> None:
         self._order = self.rng.permutation(len(self.records)).tolist()
@@ -415,7 +467,9 @@ class _SourcePool:
             return
         slot = self.entries.index(entry)
         excluded = {item.source.record.source_id for item in self.entries}
-        self.entries[slot] = _CacheEntry(PackedSource(self._next_record(excluded)))
+        self.entries[slot] = _CacheEntry(
+            PackedSource(self._next_record(excluded), self.config)
+        )
 
 
 @dataclass(frozen=True)
@@ -439,11 +493,11 @@ class _BatchFactory:
                 config.negative_local_weight,
                 config.negative_same_time_weight,
                 config.negative_random_weight,
-                config.counterfactual_negative_weight,
+                config.negative_partial_weight,
             ],
             dtype=np.float64,
         )
-        self.negative_kinds = ("local", "same_time", "random", "counterfactual")
+        self.negative_kinds = ("local", "same_time", "random", "partial")
         self.negative_probabilities = weights / weights.sum()
 
     def _positive_start_bounds(self, source: PackedSource, time_start: int) -> tuple[int, int] | None:
@@ -502,6 +556,37 @@ class _BatchFactory:
         if right_lower <= maximum_start:
             intervals.append((max(0, right_lower), maximum_start))
         return [(lower, upper) for lower, upper in intervals if lower <= upper]
+
+    def _partial_start_intervals(self, source: PackedSource, time_start: int) -> list[tuple[int, int]]:
+        """返回恰好由左或右边界截断潜在轨迹的块起点区间。"""
+        trajectory = source.target_true_range_m[time_start : time_start + self.config.frames_per_window]
+        trajectory_min = float(np.min(trajectory))
+        trajectory_max = float(np.max(trajectory))
+        width = self.config.block_width_m
+        maximum_start = self.config.range_bins - width
+        raw_intervals = (
+            (math.floor(trajectory_min) + 1, math.floor(trajectory_max)),
+            (math.floor(trajectory_min - width) + 1, math.floor(trajectory_max - width)),
+        )
+        return [
+            (max(0, lower), min(maximum_start, upper))
+            for lower, upper in raw_intervals
+            if max(0, lower) <= min(maximum_start, upper)
+        ]
+
+    def _sample_partial_negative(self, source: PackedSource, time_start: int) -> dict[str, Any] | None:
+        """抽取轨迹与块相交但被边界截断的 q*=0 困难负样本。"""
+        intervals = self._partial_start_intervals(source, time_start)
+        if not intervals:
+            return None
+        lengths = np.asarray([upper - lower + 1 for lower, upper in intervals], dtype=np.float64)
+        index = int(self.rng.choice(len(intervals), p=lengths / lengths.sum()))
+        lower, upper = intervals[index]
+        range_start = int(self.rng.integers(lower, upper + 1))
+        labels = build_target_labels(source, time_start, range_start, self.config)
+        if int(labels["track_relation"]) != 2:
+            raise RuntimeError("部分相交起点计算与标签关系不一致。")
+        return _sample_to_numpy(source, time_start, range_start, self.config, labels=labels)
 
     def _choose_disjoint_start(
         self,
@@ -586,26 +671,19 @@ class _BatchFactory:
             kind = self.negative_kinds[
                 int(self.rng.choice(len(self.negative_kinds), p=self.negative_probabilities))
             ]
-            if kind == "counterfactual":
-                return _sample_to_numpy(
-                    context.source,
-                    context.time_start,
-                    context.range_start,
-                    self.config,
-                    background_only=True,
-                    labels=_negative_labels(self.config),
-                )
             if kind == "local":
                 sample = self._sample_normal_negative(context.source, context.time_start, local=True)
             elif kind == "same_time":
                 sample = self._sample_normal_negative(context.source, context.time_start, local=False)
+            elif kind == "partial":
+                sample = self._sample_partial_negative(context.source, context.time_start)
             else:
                 source = self.pool.choose().source
                 time_start = int(self.rng.integers(0, source.frames - self.config.frames_per_window + 1))
                 sample = self._sample_normal_negative(source, time_start, local=False)
             if sample is not None:
                 return sample
-        raise RuntimeError("连续 512 次无法构造不相交负样本；请检查距离范围和保护带。")
+        raise RuntimeError("连续 512 次无法构造有效负样本；请检查距离范围和采样权重。")
 
     def make_batch(self) -> dict[str, torch.Tensor]:
         """构造一个本地 GPU batch，并在返回前随机打乱正负样本顺序。"""
@@ -628,7 +706,7 @@ class _BatchFactory:
             "I": torch.from_numpy(np.stack([sample["I"] for sample in samples]).astype(np.bool_, copy=False)),
             "d": torch.from_numpy(np.stack([sample["d"] for sample in samples]).astype(np.int64, copy=False)),
             "q": torch.from_numpy(np.asarray([sample["q"] for sample in samples], dtype=np.float32)),
-            "m_line": torch.from_numpy(np.asarray([sample["m_line"] for sample in samples], dtype=np.bool_)),
+            "q_valid": torch.from_numpy(np.asarray([sample["q_valid"] for sample in samples], dtype=np.bool_)),
             "is_positive": torch.from_numpy(
                 np.asarray([sample["is_positive"] for sample in samples], dtype=np.bool_)
             ),
@@ -814,6 +892,7 @@ class StandardGridDataset(Dataset[dict[str, torch.Tensor]]):
             raw_response_mask = archive["response_mask"]
             raw_response_bin = archive["response_bin"]
             raw_is_positive = archive["is_positive"]
+            raw_q_valid = archive["q_valid"]
 
         self._validate_manifest_arrays(
             manifest_path,
@@ -825,6 +904,7 @@ class StandardGridDataset(Dataset[dict[str, torch.Tensor]]):
             raw_response_mask,
             raw_response_bin,
             raw_is_positive,
+            raw_q_valid,
         )
         if uses_relative_paths:
             self.source_paths = tuple(
@@ -839,6 +919,7 @@ class StandardGridDataset(Dataset[dict[str, torch.Tensor]]):
         self.response_mask = raw_response_mask.astype(np.bool_, copy=False)
         self.response_bin = raw_response_bin.astype(np.int16, copy=False)
         self.is_positive = raw_is_positive.astype(np.bool_, copy=False)
+        self.q_valid = raw_q_valid.astype(np.bool_, copy=False)
         self.source_spans = self._build_source_spans()
         if verify_cached_samples:
             self._verify_cached_samples(manifest_path)
@@ -855,6 +936,7 @@ class StandardGridDataset(Dataset[dict[str, torch.Tensor]]):
         response_mask: np.ndarray,
         response_bin: np.ndarray,
         is_positive: np.ndarray,
+        q_valid: np.ndarray,
     ) -> None:
         """完整校验 cache 数组契约，避免损坏内容在 DataLoader worker 中延迟报错。"""
         problems: list[str] = []
@@ -878,6 +960,7 @@ class StandardGridDataset(Dataset[dict[str, torch.Tensor]]):
             "response_mask": (sample_count, self.config.frames_per_window),
             "response_bin": (sample_count, self.config.frames_per_window),
             "is_positive": (sample_count,),
+            "q_valid": (sample_count,),
         }
         arrays = {
             "source_index": source_index,
@@ -886,6 +969,7 @@ class StandardGridDataset(Dataset[dict[str, torch.Tensor]]):
             "response_mask": response_mask,
             "response_bin": response_bin,
             "is_positive": is_positive,
+            "q_valid": q_valid,
         }
         for name, array in arrays.items():
             if array.shape != expected_shapes[name]:
@@ -893,8 +977,8 @@ class StandardGridDataset(Dataset[dict[str, torch.Tensor]]):
         for name in ("source_index", "time_start", "range_start", "response_bin"):
             if not np.issubdtype(arrays[name].dtype, np.integer):
                 problems.append(f"{name} 必须使用整数 dtype")
-        if response_mask.dtype != np.bool_ or is_positive.dtype != np.bool_:
-            problems.append("response_mask/is_positive 必须使用 bool dtype")
+        if any(array.dtype != np.bool_ for array in (response_mask, is_positive, q_valid)):
+            problems.append("response_mask/is_positive/q_valid 必须使用 bool dtype")
 
         shapes_valid = not any(array.shape != expected_shapes[name] for name, array in arrays.items())
         dtypes_valid = all(
@@ -922,6 +1006,8 @@ class StandardGridDataset(Dataset[dict[str, torch.Tensor]]):
                 problems.append("response_mask 与 response_bin 的有效位置不一致")
             if np.any(is_positive & ~response_mask.any(axis=1)):
                 problems.append("is_positive 样本必须至少包含一个响应点")
+            if np.any(is_positive & ~q_valid):
+                problems.append("is_positive 样本必须启用 q 监督")
         if problems:
             raise ValueError(f"grid manifest 结构无效：{'；'.join(problems)}。文件：{manifest_path}")
 
@@ -953,7 +1039,11 @@ class StandardGridDataset(Dataset[dict[str, torch.Tensor]]):
             source = label_sources.get(source_index)
             if source is None:
                 source = LabelSource(
-                    SourceRecord(self.source_ids[source_index], self.source_paths[source_index])
+                    SourceRecord(
+                        self.source_ids[source_index],
+                        self.source_paths[source_index],
+                    ),
+                    self.config,
                 )
                 label_sources[source_index] = source
             expected = build_target_labels(
@@ -965,7 +1055,8 @@ class StandardGridDataset(Dataset[dict[str, torch.Tensor]]):
             checks = (
                 ("response_mask", np.array_equal(self.response_mask[sample_index], expected["I"])),
                 ("response_bin", np.array_equal(self.response_bin[sample_index], expected["d"])),
-                ("q", bool(np.float32(self.response_mask[sample_index].mean()) == expected["q"])),
+                ("q", bool(np.float32(self.is_positive[sample_index]) == expected["q"])),
+                ("q_valid", bool(self.q_valid[sample_index] == expected["q_valid"])),
                 ("is_positive", bool(self.is_positive[sample_index] == expected["is_positive"])),
             )
             for field_name, matched in checks:
@@ -992,7 +1083,7 @@ class StandardGridDataset(Dataset[dict[str, torch.Tensor]]):
             self._cache[source_index] = source
             return source
         record = SourceRecord(self.source_ids[source_index], self.source_paths[source_index])
-        source = PackedSource(record)
+        source = PackedSource(record, self.config)
         self._cache[source_index] = source
         while len(self._cache) > self.config.source_cache_size:
             self._cache.popitem(last=False)
@@ -1008,8 +1099,8 @@ class StandardGridDataset(Dataset[dict[str, torch.Tensor]]):
             "x": torch.from_numpy(rearrange_distance_channels(raw_window, self.config).astype(np.float32, copy=False)),
             "I": torch.from_numpy(self.response_mask[index].copy()),
             "d": torch.from_numpy(self.response_bin[index].copy()),
-            "q": torch.tensor(self.response_mask[index].mean(), dtype=torch.float32),
-            "m_line": torch.tensor(self.is_positive[index], dtype=torch.bool),
+            "q": torch.tensor(float(self.is_positive[index]), dtype=torch.float32),
+            "q_valid": torch.tensor(self.q_valid[index], dtype=torch.bool),
             "is_positive": torch.tensor(self.is_positive[index], dtype=torch.bool),
         }
 
@@ -1181,7 +1272,7 @@ def _build_grid_manifest(
     distance_starts = np.asarray(standard_distance_starts(config), dtype=np.int32)
     distance_count = len(distance_starts)
     frames = config.frames_per_window
-    label_sources = tuple(LabelSource(record) for record in records)
+    label_sources = tuple(LabelSource(record, config) for record in records)
     source_sample_counts = [
         len(standard_time_starts(source.frames, config)) * distance_count
         for source in label_sources
@@ -1194,6 +1285,7 @@ def _build_grid_manifest(
         "response_mask": np.empty((total_sample_count, frames), dtype=np.bool_),
         "response_bin": np.empty((total_sample_count, frames), dtype=np.int16),
         "is_positive": np.empty(total_sample_count, dtype=np.bool_),
+        "q_valid": np.empty(total_sample_count, dtype=np.bool_),
     }
     write_offset = 0
 
@@ -1235,7 +1327,9 @@ def _build_grid_manifest(
             .astype(np.int16, copy=False)
         )
         hit_count = response_mask.sum(axis=1)
-        valid_line = (is_full & (hit_count.reshape(time_count, distance_count) > 0)).reshape(-1)
+        hit_count_grid = hit_count.reshape(time_count, distance_count)
+        valid_line = (is_full & (hit_count_grid > 0)).reshape(-1)
+        q_valid = ~(is_full & (hit_count_grid == 0)).reshape(-1)
 
         fields["source_index"][sample_slice] = source_index
         fields["time_start"][sample_slice] = np.repeat(time_starts, distance_count)
@@ -1243,13 +1337,16 @@ def _build_grid_manifest(
         fields["response_mask"][sample_slice] = response_mask
         fields["response_bin"][sample_slice] = response_bin
         fields["is_positive"][sample_slice] = valid_line
+        fields["q_valid"][sample_slice] = q_valid
         write_offset += sample_count
 
     source_signatures = np.asarray(_record_file_signatures(records), dtype=np.int64)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     np.savez_compressed(
         output_path,
+        schema_version=np.asarray(_GRID_CACHE_SCHEMA_VERSION, dtype=np.int16),
         source_ids=np.asarray([record.source_id for record in records]),
+        q_valid=fields["q_valid"],
         source_relative_paths=np.asarray(_record_relative_paths(records, config.data_root)),
         source_sizes=source_signatures[:, 0],
         source_mtime_ns=source_signatures[:, 1],
@@ -1354,6 +1451,8 @@ def _is_valid_grid_cache(
                 return False
         with np.load(cache_path, allow_pickle=False) as archive:
             if not _GRID_CACHE_REQUIRED_FIELDS.issubset(archive.files):
+                return False
+            if int(archive["schema_version"].item()) != _GRID_CACHE_SCHEMA_VERSION:
                 return False
             cached_ids = tuple(str(value) for value in archive["source_ids"].tolist())
             cached_paths = tuple(str(value) for value in archive["source_relative_paths"].tolist())
@@ -1492,7 +1591,11 @@ def build_train_dataloader(
         "pin_memory": config.pin_memory,
     }
     if config.num_workers > 0:
-        kwargs.update({"persistent_workers": True, "prefetch_factor": 2})
+        kwargs.update({
+            "persistent_workers": True,
+            "prefetch_factor": 2,
+            "worker_init_fn": _initialize_train_worker_process,
+        })
     return DataLoader(**kwargs)
 
 
@@ -1558,5 +1661,9 @@ def build_validation_dataloader(
         "drop_last": False,
     }
     if effective_num_workers > 0:
-        kwargs.update({"persistent_workers": True, "prefetch_factor": 2})
+        kwargs.update({
+            "persistent_workers": True,
+            "prefetch_factor": 2,
+            "worker_init_fn": _initialize_eval_worker_process,
+        })
     return DataLoader(**kwargs)

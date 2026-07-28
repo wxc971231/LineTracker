@@ -28,6 +28,7 @@ from runtime.settings import apply_device_defaults, apply_runtime_settings, load
 from train.model import SimpleCNN
 from utils.checkpoint import load_checkpoint
 from utils.distributed import broadcast_object, cleanup_distributed, rank_zero_print, setup_distributed
+from utils.process_title import set_process_title
 from utils.seed import seed_everything
 
 
@@ -204,6 +205,8 @@ def main() -> None:
     args.checkpoint = CHECKPOINT_PATH
     args.eval_data_root = EVAL_DATA_ROOT
     args.max_eval_batch_num = 0
+    experiment_label = args.checkpoint.parent.parent.name
+    set_process_title("eval", label=experiment_label)
 
     # 未显式传入时，使用本机同步回来的 NPU 集群训练 best.pt。
     if not args.eval_data_root.is_dir():

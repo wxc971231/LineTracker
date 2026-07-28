@@ -15,10 +15,8 @@ def seed_everything(seed: int, rank: int = 0) -> int:
     np.random.seed(effective_seed % (2**32))
     torch.manual_seed(effective_seed)
     if torch.cuda.is_available():
-        torch.cuda.manual_seed(effective_seed)
         torch.cuda.manual_seed_all(effective_seed)
     if hasattr(torch, "npu") and torch.npu.is_available():
-        torch.npu.manual_seed(effective_seed)
         torch.npu.manual_seed_all(effective_seed)
     return effective_seed
 

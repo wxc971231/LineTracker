@@ -22,6 +22,16 @@ from utils.distributed import DistributedContext, broadcast_module_buffers, rank
 from utils.logging import WandbLogger
 
 
+def _configure_distributed_batch_norm(
+    model: SimpleCNN,
+    context: DistributedContext,
+) -> SimpleCNN:
+    """在 CUDA/NPU 多卡训练中使用全局同步的 BatchNorm 统计量。"""
+    if context.is_distributed and context.device.type in {"cuda", "npu"}:
+        return nn.SyncBatchNorm.convert_sync_batchnorm(model)
+    return model
+
+
 class Trainer:
     """SimpleCNN-v1 的单机单卡/多卡统一训练器。"""
 
@@ -54,12 +64,15 @@ class Trainer:
         self.requires_resume_validation_baseline = False
         self.train_iterator = iter(train_loader)
 
-        self.raw_model = SimpleCNN(config).to(context.device)
+        self.raw_model = _configure_distributed_batch_norm(
+            SimpleCNN(config),
+            context,
+        ).to(context.device)
         self.ddp_model: DistributedDataParallel | None = None
         if context.is_distributed:
             ddp_kwargs: dict[str, Any] = {
-                # 模型包含 BatchNorm；每次 forward 前从 rank 0 同步 running
-                # statistics，确保分布式验证使用一致的模型状态。
+                # SyncBatchNorm 在 CUDA/NPU 多卡前向中聚合 batch 统计量；
+                # buffer 广播继续保证验证开始前各 rank 状态完全一致。
                 "broadcast_buffers": True,
                 "find_unused_parameters": False,
             }
@@ -94,9 +107,11 @@ class Trainer:
     def _validation_metric_kind(self) -> str:
         """标识用于选择 best checkpoint 的可比较验证协议。"""
         if self.config.max_eval_batch_num == 0:
-            return f"full_grid_v2:data={self.validation_dataset_id}"
+            return (
+                f"full_grid_v3:data={self.validation_dataset_id}:q=visible-full-v2:line-scale={self.config.line_loss_scale:g}"
+            )
         return (
-            f"resampled_replacement_v1:data={self.validation_dataset_id}:seed={self.config.seed}:"
+            f"resampled_replacement_v2:data={self.validation_dataset_id}:q=visible-full-v2:line-scale={self.config.line_loss_scale:g}:seed={self.config.seed}:"
             f"batches={self.config.max_eval_batch_num}:batch={self.config.eval_batch_size_per_gpu}:"
             f"world={self.context.world_size}"
         )
@@ -231,6 +246,10 @@ class Trainer:
     ) -> torch.Tensor:
         """转为与 eval.metrics 相同顺序、兼容当前后端的累加统计量。"""
         q_error = prediction["q"].float() - batch["q"].float()
+        q_valid = batch["q_valid"].bool()
+        q_valid_float = q_valid.to(dtype=q_error.dtype)
+        q_predicted_positive = prediction["q"].float() >= 0.5
+        q_target_positive = batch["q"].bool()
         device = q_error.device
         metric_dtype = metric_accumulator_dtype(device)
         return torch.stack(
@@ -242,8 +261,12 @@ class Trainer:
                 losses.abs_error_sum.detach().to(dtype=metric_dtype),
                 losses.squared_error_sum.detach().to(dtype=metric_dtype),
                 losses.point_count.detach().to(dtype=metric_dtype),
-                q_error.abs().sum().detach().to(dtype=metric_dtype),
-                q_error.square().sum().detach().to(dtype=metric_dtype),
+                (q_error.abs() * q_valid_float).sum().detach().to(dtype=metric_dtype),
+                (q_error.square() * q_valid_float).sum().detach().to(dtype=metric_dtype),
+                (q_valid & q_predicted_positive & q_target_positive).sum().detach().to(dtype=metric_dtype),
+                (q_valid & q_predicted_positive & ~q_target_positive).sum().detach().to(dtype=metric_dtype),
+                (q_valid & ~q_predicted_positive & ~q_target_positive).sum().detach().to(dtype=metric_dtype),
+                (q_valid & ~q_predicted_positive & q_target_positive).sum().detach().to(dtype=metric_dtype),
                 torch.tensor(float(batch["x"].shape[0]), device=device, dtype=metric_dtype),
                 batch["is_positive"].sum().detach().to(dtype=metric_dtype),
             ]

@@ -418,7 +418,7 @@ def save_sample_preview(
     # 延迟导入，保证只调用背景函数时无需加载绘图库。
     import matplotlib.pyplot as plt
 
-    plt.rcParams["font.sans-serif"] = ["Noto Sans CJK SC", "DejaVu Sans"]
+    plt.rcParams["font.sans-serif"] = ["Noto Sans CJK SC", "WenQuanYi Micro Hei", "DejaVu Sans",]
     plt.rcParams["axes.unicode_minus"] = False
 
     probability_1m = np.asarray(probability_1m, dtype=np.float64)

@@ -71,6 +71,10 @@ def evaluate_model(
             prediction = model(batch["x"])
             losses = compute_losses(prediction, batch, config)
         q_error = prediction["q"].float() - batch["q"].float()
+        q_valid = batch["q_valid"].bool()
+        q_valid_float = q_valid.to(dtype=q_error.dtype)
+        q_predicted_positive = prediction["q"].float() >= 0.5
+        q_target_positive = batch["q"].bool()
         totals += torch.stack(
             [
                 losses.q_loss_sum.detach().to(dtype=metric_dtype),
@@ -80,8 +84,12 @@ def evaluate_model(
                 losses.abs_error_sum.detach().to(dtype=metric_dtype),
                 losses.squared_error_sum.detach().to(dtype=metric_dtype),
                 losses.point_count.detach().to(dtype=metric_dtype),
-                q_error.abs().sum().detach().to(dtype=metric_dtype),
-                q_error.square().sum().detach().to(dtype=metric_dtype),
+                (q_error.abs() * q_valid_float).sum().detach().to(dtype=metric_dtype),
+                (q_error.square() * q_valid_float).sum().detach().to(dtype=metric_dtype),
+                (q_valid & q_predicted_positive & q_target_positive).sum().detach().to(dtype=metric_dtype),
+                (q_valid & q_predicted_positive & ~q_target_positive).sum().detach().to(dtype=metric_dtype),
+                (q_valid & ~q_predicted_positive & ~q_target_positive).sum().detach().to(dtype=metric_dtype),
+                (q_valid & ~q_predicted_positive & q_target_positive).sum().detach().to(dtype=metric_dtype),
                 torch.tensor(float(batch["x"].shape[0]), device=context.device, dtype=metric_dtype),
                 batch["is_positive"].sum().detach().to(dtype=metric_dtype),
             ]

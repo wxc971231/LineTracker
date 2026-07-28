@@ -15,9 +15,10 @@ if str(METHOD_ROOT) not in sys.path:
     sys.path.insert(0, str(METHOD_ROOT))
 
 from configs.base import SimpleCNNConfig
+from eval.metrics import METRIC_NAMES
 from train.losses import compute_losses
 from train.model import SimpleCNN
-from train.trainer import Trainer
+from train.trainer import Trainer, _configure_distributed_batch_norm
 from utils.distributed import DistributedContext, broadcast_module_buffers
 
 
@@ -32,9 +33,10 @@ class LossTests(unittest.TestCase):
         prediction = {"q_logit": q_logit, "rho_m": rho, "nu_mpf": nu}
         batch = {
             "q": torch.zeros(2),
+            "q_valid": torch.ones(2, dtype=torch.bool),
             "I": torch.zeros((2, config.frames_per_window), dtype=torch.bool),
             "d": torch.full((2, config.frames_per_window), -1, dtype=torch.int16),
-            "m_line": torch.zeros(2, dtype=torch.bool),
+            "is_positive": torch.zeros(2, dtype=torch.bool),
         }
 
         losses = compute_losses(prediction, batch, config)
@@ -57,9 +59,10 @@ class LossTests(unittest.TestCase):
                 prediction = {"q_logit": q_logit, "rho_m": rho, "nu_mpf": nu}
                 batch = {
                     "q": torch.ones(2),
+                    "q_valid": torch.ones(2, dtype=torch.bool),
                     "I": torch.ones((2, config.frames_per_window), dtype=torch.bool),
                     "d": torch.full((2, config.frames_per_window), 300_000, dtype=torch.int64),
-                    "m_line": torch.ones(2, dtype=torch.bool),
+                    "is_positive": torch.ones(2, dtype=torch.bool),
                 }
 
                 losses = compute_losses(prediction, batch, config)
@@ -77,6 +80,46 @@ class LossTests(unittest.TestCase):
                 for tensor in (q_logit, rho, nu):
                     self.assertIsNotNone(tensor.grad)
                     self.assertTrue(torch.isfinite(tensor.grad).all().item())
+
+    def test_q_loss_ignores_zero_evidence_sample(self) -> None:
+        config = SimpleCNNConfig()
+        q_logit = torch.tensor([10.0, 0.0], requires_grad=True)
+        rho = torch.zeros(2, requires_grad=True)
+        nu = torch.zeros(2, requires_grad=True)
+        prediction = {"q_logit": q_logit, "rho_m": rho, "nu_mpf": nu}
+        batch = {
+            "q": torch.zeros(2),
+            "q_valid": torch.tensor([False, True]),
+            "I": torch.zeros((2, config.frames_per_window), dtype=torch.bool),
+            "d": torch.full((2, config.frames_per_window), -1, dtype=torch.int64),
+            "is_positive": torch.zeros(2, dtype=torch.bool),
+        }
+
+        losses = compute_losses(prediction, batch, config)
+        losses.total.backward()
+
+        self.assertEqual(losses.q_count.item(), 1.0)
+        self.assertAlmostEqual(losses.q_loss.item(), 0.693147, places=5)
+        self.assertEqual(q_logit.grad[0].item(), 0.0)
+
+    def test_line_huber_is_divided_by_fixed_scale(self) -> None:
+        config = SimpleCNNConfig(line_loss_scale=5_000.0, huber_delta_bins=3.0)
+        q_logit = torch.zeros(1, requires_grad=True)
+        rho = torch.tensor([100.0], requires_grad=True)
+        nu = torch.zeros(1, requires_grad=True)
+        prediction = {"q_logit": q_logit, "rho_m": rho, "nu_mpf": nu}
+        batch = {
+            "q": torch.ones(1),
+            "q_valid": torch.ones(1, dtype=torch.bool),
+            "I": torch.ones((1, config.frames_per_window), dtype=torch.bool),
+            "d": torch.zeros((1, config.frames_per_window), dtype=torch.int64),
+            "is_positive": torch.ones(1, dtype=torch.bool),
+        }
+
+        losses = compute_losses(prediction, batch, config)
+        raw_huber = 3.0 * (100.0 - 1.5)
+        self.assertAlmostEqual(losses.line_loss.item(), raw_huber / 5_000.0, places=6)
+
 
 
 class _CaptureLogger:
@@ -136,9 +179,9 @@ class TrainerMetricTests(unittest.TestCase):
         trainer.global_step = 20
         parameter = torch.nn.Parameter(torch.tensor(0.0))
         trainer.optimizer = torch.optim.SGD([parameter], lr=0.1)
-        totals = torch.zeros(11, dtype=torch.float64)
+        totals = torch.zeros(len(METRIC_NAMES), dtype=torch.float64)
         totals[1] = 1.0
-        totals[9] = 1.0
+        totals[METRIC_NAMES.index("block_count")] = 1.0
 
         with mock.patch("train.trainer.rank_zero_print"):
             trainer._log_train_totals(totals, grad_norm=0.0, elapsed=4.0, step_count=20)
@@ -162,8 +205,8 @@ class TrainerMetricTests(unittest.TestCase):
             "x": torch.zeros((2, 1)),
             "q": torch.zeros(2),
             "I": torch.zeros((2, 20), dtype=torch.bool),
+            "q_valid": torch.ones(2, dtype=torch.bool),
             "d": torch.full((2, 20), -1, dtype=torch.int64),
-            "m_line": torch.zeros(2, dtype=torch.bool),
             "is_positive": torch.zeros(2, dtype=torch.bool),
         }
         trainer.train_loader = [batch]
@@ -190,8 +233,8 @@ class TrainerMetricTests(unittest.TestCase):
             "x": torch.zeros((2, 1)),
             "q": torch.zeros(2),
             "I": torch.zeros((2, 20), dtype=torch.bool),
+            "q_valid": torch.ones(2, dtype=torch.bool),
             "d": torch.full((2, 20), -1, dtype=torch.int64),
-            "m_line": torch.zeros(2, dtype=torch.bool),
             "is_positive": torch.zeros(2, dtype=torch.bool),
         }
         trainer.train_loader = [batch]
@@ -345,6 +388,35 @@ class DistributedBufferTests(unittest.TestCase):
 
         self.assertEqual(broadcast.call_count, len(tuple(model.buffers())))
 
+    def test_accelerator_ddp_converts_batch_norm_without_changing_state_keys(self) -> None:
+        model = SimpleCNN(SimpleCNNConfig())
+        original_state_keys = tuple(model.state_dict())
+        context = DistributedContext(0, 0, 2, torch.device("cuda", 0), "nccl")
+
+        converted = _configure_distributed_batch_norm(model, context)
+
+        self.assertTrue(
+            any(isinstance(module, torch.nn.SyncBatchNorm) for module in converted.modules())
+        )
+        self.assertFalse(
+            any(type(module) is torch.nn.BatchNorm2d for module in converted.modules())
+        )
+        self.assertEqual(tuple(converted.state_dict()), original_state_keys)
+
+    def test_single_device_and_cpu_ddp_keep_regular_batch_norm(self) -> None:
+        contexts = (
+            DistributedContext(0, 0, 1, torch.device("cuda", 0), "nccl"),
+            DistributedContext(0, 0, 2, torch.device("cpu"), "gloo"),
+        )
+        for context in contexts:
+            with self.subTest(context=context):
+                model = _configure_distributed_batch_norm(SimpleCNN(SimpleCNNConfig()), context)
+                self.assertTrue(
+                    any(type(module) is torch.nn.BatchNorm2d for module in model.modules())
+                )
+                self.assertFalse(
+                    any(isinstance(module, torch.nn.SyncBatchNorm) for module in model.modules())
+                )
 
 class ModelCapacityTests(unittest.TestCase):
     """验证 n/s 容量规格只扩展网络宽度，保持统一模型接口。"""

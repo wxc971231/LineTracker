@@ -51,7 +51,7 @@ def compute_losses(
 
     对第 $\tau$ 帧，预测距离 bin 为
     ``rho_m + nu_mpf * (tau - 9.5)``。仅在 $I_\tau=1$ 且该块
-    ``m_line=True`` 时，才将它与实际响应 bin $d_\tau$ 比较。
+    ``is_positive=True`` 时，才将它与实际响应 bin $d_\tau$ 比较。
     """
     # 模型前向可以使用 FP16/BF16，但损失与指标统计始终提升到 FP32。
     # 距离残差可达到几十万 bin，若沿用 FP16，平方和甚至 Huber 累加
@@ -61,8 +61,9 @@ def compute_losses(
     q_per_sample = functional.binary_cross_entropy_with_logits(
         q_logit, q_target, reduction="none"
     )
-    q_loss_sum = q_per_sample.sum()
-    q_count = torch.tensor(float(q_per_sample.numel()), device=q_per_sample.device)
+    q_valid_float = batch["q_valid"].to(dtype=q_per_sample.dtype)
+    q_loss_sum = (q_per_sample * q_valid_float).sum()
+    q_count = q_valid_float.sum()
     q_loss = q_loss_sum / q_count.clamp_min(1.0)
 
     frame_index = torch.arange(
@@ -76,17 +77,18 @@ def compute_losses(
     predicted_bin = rho_m.unsqueeze(1) + nu_mpf.unsqueeze(1) * (
         frame_index.unsqueeze(0) - tau_zero
     )
-    point_mask = batch["I"].bool() & batch["m_line"].bool().unsqueeze(1)
+    valid_block = batch["is_positive"].bool()
+    point_mask = batch["I"].bool() & valid_block.unsqueeze(1)
     target_bin = batch["d"].float()
     residual = predicted_bin - target_bin
     huber_per_point = _huber_loss_per_point(predicted_bin, target_bin, config.huber_delta_bins)
 
-    # 先按每个块的响应数归一化，再仅在 m_line 块之间平均，
-    # 避免目标响应更多的块仅因点数更多而获得更大总权重。
-    valid_block = batch["m_line"].bool()
+    # 先按每个块的响应数归一化，再仅在可见正样本块之间平均，
+    # 避免目标响应更多的块仅因点数更多而获得更大总权重；固定尺度只调整损失数值。
     point_count_per_block = point_mask.sum(dim=1)
     line_sum_per_block = (huber_per_point * point_mask).sum(dim=1)
     line_per_block = line_sum_per_block / point_count_per_block.clamp_min(1)
+    line_per_block = line_per_block / config.line_loss_scale
     valid_block_float = valid_block.to(dtype=predicted_bin.dtype)
     line_count = valid_block_float.sum()
     line_loss_sum = (line_per_block * valid_block_float).sum()

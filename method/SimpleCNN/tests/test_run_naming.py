@@ -67,6 +67,7 @@ class RunNamingTests(unittest.TestCase):
             output_root=Path("/another/output"),
             resume=Path("/another/last.pt"),
             pin_memory=False,
+            num_workers=7,
             log_interval_steps=999,
             checkpoint_interval_steps=777,
             keep_last_checkpoints=9,
@@ -78,6 +79,19 @@ class RunNamingTests(unittest.TestCase):
         self.assertEqual(
             algorithm_config_digest(self.config),
             algorithm_config_digest(changed_runtime),
+        )
+
+    def test_digest_normalizes_equivalent_negative_sampling_weights(self) -> None:
+        scaled_weights = replace(
+            self.config,
+            negative_local_weight=0.25,
+            negative_same_time_weight=0.25,
+            negative_random_weight=0.25,
+            negative_partial_weight=0.25,
+        )
+
+        self.assertEqual(
+            algorithm_config_digest(self.config), algorithm_config_digest(scaled_weights)
         )
 
     def test_digest_changes_with_algorithm_setting(self) -> None:

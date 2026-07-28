@@ -38,6 +38,7 @@ from utils.distributed import (
     setup_distributed,
 )
 from utils.logging import WandbLogger
+from utils.process_title import set_process_title
 from utils.run_naming import build_experiment_slug
 from utils.seed import seed_everything
 
@@ -67,18 +68,17 @@ def _next_data_stream_generation(payload: dict | None) -> int:
 if __name__ == "__main__":
     """准备 DDP、固定数据清单、W&B 并启动按 step 的训练。"""
 
-    # 入口参数，可被命令行覆盖
-    # resume_ckpt = Path(
-    #     "/mnt/host-model/weixc/code/LineTracker/method/SimpleCNN/runs/simplecnn_v1/"
-    #     "limit50k-gbs1024-lr5e-4-pos25-vs5-modeln-cfgc267d7ac/"
-    #     "20260726_195844/checkpoints/last.pt"
-    # )
-    resume_ckpt = None 
     args = parse_entrypoint_args(
         config="simplecnn_v1",      # configs 下的 profile 名称
-        resume=resume_ckpt,             
+        resume=Path(
+            "/mnt/host-model/weixc/code/LineTracker/method/SimpleCNN/runs/simplecnn_v2/"
+            "limit50k-gbs1024-lr5e-4-pos25-vs5-modeln-cfgc5fe62b8/"
+            "20260727_195332/checkpoints/last.pt"
+        ),
         overrides=(),               # 需要覆盖的参数字段，如 ("batch_size_per_gpu=16",)。
     )
+    # 在 HCCL/NCCL 初始化前命名，使初始化失败的 rank 也能被准确识别。
+    set_process_title("train", label=args.config)
 
     # .env 只处理机器、设备与路径；--set 仍是算法超参数的最高优先级覆盖方式。
     runtime_settings = load_runtime_settings(args.env_file)
@@ -102,10 +102,12 @@ if __name__ == "__main__":
         config = apply_device_defaults(config, runtime_settings, context.device.type)
         config = apply_overrides(config, args.set)
         config.validate()
+        # 恢复训练时以 resolved_config 中的真实 profile 替换命令行缺省名称。
+        set_process_title("train", label=config.profile, rank=context.rank)
 
         # 恢复训练沿用 checkpoint 所在实验目录；新训练在覆盖参数生效后创建目录。
         if resume_path is not None:
-            run_dir = resume_path.parent.parent
+            run_dir = _resolve_run(config, resume_path, context.world_size)
         else:
             main_run_dir = (
                 str(_resolve_run(config, None, context.world_size))
@@ -128,7 +130,11 @@ if __name__ == "__main__":
         if context.is_main:
             try:
                 run_dir.mkdir(parents=True, exist_ok=True)
-                save_config_json(config, run_dir / "resolved_config.json")
+                save_config_json(
+                    config,
+                    run_dir / "resolved_config.json",
+                    world_size=context.world_size,
+                )
                 artifacts = prepare_data_artifacts(
                     config,
                     run_dir / "data",

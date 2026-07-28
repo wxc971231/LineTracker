@@ -6,8 +6,7 @@
 
 常用命令：
 
-    conda run -n linetracker-py311 python data/synthetic/generate_dataset1_parallel.py \\
-        --samples 100 --workers 2 --random-knobs true --seed 20260717
+    conda run -n linetracker-py311 python data/synthetic/generate_dataset1_parallel.py --samples 100 --workers 2 --random-knobs true --seed 20260717
 
 建议先使用 --workers 2。单个样本会同时持有 300 x 300000 的背景、完整观测矩阵和
 绘图数据，盲目按 CPU 核数全开容易造成内存和磁盘写入争用。
@@ -130,8 +129,8 @@ def main(argv: Iterable[str] | None = None) -> None:
     parser = build_parallel_parser()
     args = parser.parse_args(argv)
 
-    args.samples = 200
-    args.workers = 5
+    # args.samples = 200
+    # args.workers = 5
 
     if args.samples <= 0:
         parser.error("--samples 必须为正整数")
