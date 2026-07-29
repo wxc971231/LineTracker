@@ -64,7 +64,7 @@ torchrun --standalone --nproc_per_node=1 train/train_ddp.py \
   --set wandb_mode=disabled
 ```
 
-每次训练会在 `runs/<run_name>/<experiment_slug>/<timestamp>/` 下保存解析后的配置、固定数据划分、`last.pt`、`best.pt` 与有限数量的 step checkpoint。例如当前8卡正式配置会生成 `limit50k-gbs1024-lr5e-4-pos25-vs5-models-cfg<8位哈希>`。其中 `gbs` 是包含 DDP 和梯度累积的全局训练 batch，`models` 表示使用 s 容量规格。
+每次训练会在 `runs/<run_name>/<experiment_slug>/<timestamp>/` 下保存解析后的配置、固定数据划分、`last.pt`、`best.pt` 与有限数量的 step checkpoint。例如当前8卡正式配置会生成 `limit50k-gbs1024-lr5e-4-pos25-vs5-models-cfg<8位哈希>`。其中 `gbs` 是包含 DDP 和梯度累积的全局训练 batch，`modelxn`、`modeln`、`models` 分别表示 0.5×、1×、1.5× 容量规格。
 
 `cfg` 哈希覆盖模型、采样、损失、优化器、训练预算和验证协议等配置，但排除本机数据/输出路径、resume、W&B 和纯 I/O 设置。这样路径保持可读，同时任何未展示的关键算法参数变化仍会得到不同目录。恢复历史 checkpoint 时始终沿用其原 run 目录。W&B 运行名称采用相同摘要加时间戳。
 

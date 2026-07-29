@@ -68,9 +68,9 @@ class SimpleCNNConfig:
     validation_time_stride: int = 5                 # 固定验证网格在时间轴上的步进（帧）；最小可设为 1。
 
     # 网络结构（与 _doc/SimpleCNN.md 第 4 章一致）
-    model_type: str = "n"                          # 容量规格：n 保持基线；s 将 CNN 通道和共享 MLP hidden_dim 都放大 1.5 倍。
+    model_type: str = "n"                          # 容量规格：xn 为 n 的 0.5 倍宽度；n 保持基线；s 将 CNN 通道和共享 MLP hidden_dim 都放大 1.5 倍。
     input_channels: int = 8                         # 距离轴按 mod 8 无损重排后的输入通道数。
-    hidden_dim: int = 256                           # n 规格 Flatten 后共享 MLP 隐层的特征维度；s 规格自动使用其 1.5 倍。
+    hidden_dim: int = 256                           # n 规格 Flatten 后共享 MLP 隐层的特征维度；xn/s 规格自动使用其 0.5/1.5 倍。
     dropout: float = 0.10                           # 共享 MLP 隐层的 dropout 概率。
     max_speed_per_frame_m: float = 17.0             # 斜率头的绝对上限（m/frame），对应 340 m/s 和 50 ms 帧间隔。
 
@@ -174,8 +174,8 @@ class SimpleCNNConfig:
             raise ValueError("source_sample_limit 必须为非负整数；0 表示使用全部序列。")
         if self.hidden_dim < 1:
             raise ValueError("hidden_dim 必须为正。")
-        if self.model_type not in {"n", "s"}:
-            raise ValueError("model_type 仅支持 n 或 s。")
+        if self.model_type not in {"xn", "n", "s"}:
+            raise ValueError("model_type 仅支持 xn、n 或 s。")
         if not 0.0 <= self.dropout < 1.0:
             raise ValueError("dropout 必须位于 [0, 1)。")
         if self.max_speed_per_frame_m <= 0.0:

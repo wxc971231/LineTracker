@@ -1,0 +1,5 @@
+# 推理运行生成的图片、逐步诊断和汇总结果
+global_top1/outputs/**
+adaptive_tracker/outputs/**
+!global_top1/outputs/.gitkeep
+!adaptive_tracker/outputs/.gitkeep

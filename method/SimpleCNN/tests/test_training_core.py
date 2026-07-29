@@ -419,12 +419,15 @@ class DistributedBufferTests(unittest.TestCase):
                 )
 
 class ModelCapacityTests(unittest.TestCase):
-    """验证 n/s 容量规格只扩展网络宽度，保持统一模型接口。"""
+    """验证 xn/n/s 容量规格只调整网络宽度，保持统一模型接口。"""
 
-    def test_n_and_s_use_expected_widths(self) -> None:
+    def test_xn_n_and_s_use_expected_widths(self) -> None:
+        extra_narrow = SimpleCNN(SimpleCNNConfig(model_type="xn", hidden_dim=256))
         normal = SimpleCNN(SimpleCNNConfig(model_type="n", hidden_dim=256))
         scaled = SimpleCNN(SimpleCNNConfig(model_type="s", hidden_dim=256))
 
+        self.assertEqual(extra_narrow.feature_channels, (8, 16, 32, 32, 48, 48))
+        self.assertEqual(extra_narrow.hidden_dim, 128)
         self.assertEqual(normal.feature_channels, (16, 32, 64, 64, 96, 96))
         self.assertEqual(normal.hidden_dim, 256)
         self.assertEqual(scaled.feature_channels, (24, 48, 96, 96, 144, 144))
@@ -432,6 +435,10 @@ class ModelCapacityTests(unittest.TestCase):
         self.assertGreater(
             sum(parameter.numel() for parameter in scaled.parameters()),
             sum(parameter.numel() for parameter in normal.parameters()),
+        )
+        self.assertGreater(
+            sum(parameter.numel() for parameter in normal.parameters()),
+            sum(parameter.numel() for parameter in extra_narrow.parameters()),
         )
 
     def test_invalid_model_type_is_rejected_by_config_validation(self) -> None:

@@ -12,7 +12,7 @@
             "console": "integratedTerminal"
         },
         {
-            "name": "SimpleCNN · CPU · debug",
+            "name": "SimpleCNN · CPU训练",
             "type": "debugpy",
             "request": "launch",
             "program": "${workspaceFolder}/method/SimpleCNN/train/train_ddp.py",
@@ -27,7 +27,7 @@
             "justMyCode": false
         },
         {
-            "name": "SimpleCNN · 单卡 debug · auto",
+            "name": "SimpleCNN · 单卡训练 · debug",
             "type": "debugpy",
             "request": "launch",
             "program": "${workspaceFolder}/method/SimpleCNN/train/train_ddp.py",
@@ -79,7 +79,7 @@
             "env": {
                 "LT_ACCELERATOR": "auto",
                 "CUDA_VISIBLE_DEVICES": "0,1,4,5",
-                "ASCEND_RT_VISIBLE_DEVICES": "4,5,6,7,8,9,14,15",
+                "ASCEND_RT_VISIBLE_DEVICES": "2,3,4,5,6,7,8,9",
                 "HCCL_IF_BASE_PORT": "62000",
                 "OMP_NUM_THREADS": "1",
                 "ASCEND_GLOBAL_LOG_LEVEL": "3"
@@ -87,6 +87,27 @@
             "console": "integratedTerminal",
             "justMyCode": false,
             "subProcess": false
+        },
+        {
+            "name": "SimpleCNN · 单卡推理 · CUDA/NPU auto",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/method/SimpleCNN/infer/run_infer.py",
+            "args": [
+                "--device",
+                "auto"
+            ],
+            "cwd": "${workspaceFolder}/method/SimpleCNN",
+            "envFile": "${workspaceFolder}/method/SimpleCNN/.env",
+            "env": {
+                "LT_ACCELERATOR": "auto",
+                "CUDA_VISIBLE_DEVICES": "0",
+                "ASCEND_RT_VISIBLE_DEVICES": "0",
+                "OMP_NUM_THREADS": "1",
+                "ASCEND_GLOBAL_LOG_LEVEL": "3"
+            },
+            "console": "integratedTerminal",
+            "justMyCode": false
         }
     ]
 }

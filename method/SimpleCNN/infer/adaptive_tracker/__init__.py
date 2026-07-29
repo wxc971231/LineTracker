@@ -1,0 +1,1 @@
+"""CAPTURE/TRACK/RECAPTURE 自适应推理方法。"""

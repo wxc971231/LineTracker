@@ -79,7 +79,7 @@ def install_torch_npu_checkpoint_shim() -> bool:
 
 
 def infer_model_type(checkpoint: dict[str, object]) -> tuple[str, dict[str, torch.Tensor]]:
-    """从首层输出通道恢复 n/s 容量规格，并去除可选 DDP ``module.`` 前缀。"""
+    """从首层输出通道恢复 xn/n/s 容量规格，并去除可选 DDP ``module.`` 前缀。"""
     raw_state_dict = checkpoint.get("model_state")
     if not isinstance(raw_state_dict, dict):
         raise KeyError("checkpoint 缺少字典类型的 model_state。")
@@ -89,7 +89,7 @@ def infer_model_type(checkpoint: dict[str, object]) -> tuple[str, dict[str, torc
     first_layer = state_dict.get("features.0.0.weight")
     if not isinstance(first_layer, torch.Tensor):
         raise KeyError("checkpoint 缺少 features.0.0.weight，无法识别模型规格。")
-    model_type_by_channels = {16: "n", 24: "s"}
+    model_type_by_channels = {8: "xn", 16: "n", 24: "s"}
     try:
         model_type = model_type_by_channels[int(first_layer.shape[0])]
     except KeyError as error:

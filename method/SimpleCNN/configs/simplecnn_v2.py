@@ -41,13 +41,13 @@ def get_config() -> SimpleCNNConfig:
         negative_partial_weight=1.0,
 
         # batch 与验证预算保持旧实验不变。
-        batch_size_per_gpu=128,
+        batch_size_per_gpu=128*2,
         eval_batch_size_per_gpu=512,
-        max_eval_batch_num=128,
+        max_eval_batch_num=128*2,
         validation_time_stride=5,
 
         # 保持 model-n 容量，便于与旧实验做可解释对照。
-        model_type="n",
+        model_type="s",
         input_channels=8,
         hidden_dim=256,
         dropout=0.10,

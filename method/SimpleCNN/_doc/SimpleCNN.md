@@ -203,7 +203,7 @@ ReLU + Dropout
 
 前三层只压缩距离维，保留 20 帧的时间排列；随后两层同时压缩时间维和距离维。最后的 $5\times3$ 卷积将 5 个时间位置融合为 1 个时间位置，使最终高层特征显式覆盖整个 20 帧窗口，同时保留 40 个距离位置供 $\hat\rho$ 回归使用。
 
-上表对应 `model_type=n` 基线；`model_type=s` 保持卷积核、步进和输出接口不变，只把各层通道数与共享 MLP hidden dim 放大为 1.5 倍。
+上表对应 `model_type=n` 基线。`model_type=xn` 保持卷积核、步进和输出接口不变，将各层通道数与共享 MLP hidden dim 缩小为 n 的 0.5 倍；`model_type=s` 则将二者放大为 1.5 倍。
 
 单卡训练使用普通 BatchNorm；CUDA 或 Ascend NPU 多卡 DDP 训练会在建模后将其转换为 SyncBatchNorm，使均值和方差按全部 rank 的 micro-batch 共同统计。转换不改变参数名或 checkpoint 接口。
 

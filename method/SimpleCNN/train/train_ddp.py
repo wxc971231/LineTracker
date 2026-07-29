@@ -65,16 +65,26 @@ def _next_data_stream_generation(payload: dict | None) -> int:
     return generation + 1
 
 
+'''
+cd /mnt/host-model/weixc/code/LineTracker/method/SimpleCNN
+
+LT_ACCELERATOR=npu \
+ASCEND_RT_VISIBLE_DEVICES=8,9,10,11 \
+HCCL_NPU_SOCKET_PORT_RANGE=auto \
+HCCL_IF_BASE_PORT=63000 \
+HCCL_CONNECT_TIMEOUT=1800 \
+OMP_NUM_THREADS=1 \
+ASCEND_GLOBAL_LOG_LEVEL=3 \
+/root/miniconda3/envs/linetracker-py311/bin/python -m runtime.launch \
+  train/train_ddp.py --config simplecnn_v2
+'''
+
 if __name__ == "__main__":
     """准备 DDP、固定数据清单、W&B 并启动按 step 的训练。"""
 
     args = parse_entrypoint_args(
         config="simplecnn_v1",      # configs 下的 profile 名称
-        resume=Path(
-            "/mnt/host-model/weixc/code/LineTracker/method/SimpleCNN/runs/simplecnn_v2/"
-            "limit50k-gbs1024-lr5e-4-pos25-vs5-modeln-cfgc5fe62b8/"
-            "20260727_195332/checkpoints/last.pt"
-        ),
+        resume="/mnt/host-model/weixc/code/LineTracker/method/SimpleCNN/runs/simplecnn_v2/limit50k-gbs1024-lr5e-4-pos25-vs5-models-cfg11ba6304/20260728_113116/checkpoints/last.pt",
         overrides=(),               # 需要覆盖的参数字段，如 ("batch_size_per_gpu=16",)。
     )
     # 在 HCCL/NCCL 初始化前命名，使初始化失败的 rank 也能被准确识别。

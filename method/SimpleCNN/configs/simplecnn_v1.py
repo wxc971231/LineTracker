@@ -9,7 +9,7 @@ def get_config() -> SimpleCNNConfig:
     """返回与文档中 20×10000 原始二值基线一致的默认配置。"""
     return SimpleCNNConfig(
         run_name="simplecnn_v1",                # 实验系列名；输出保存到 runs/simplecnn_v1/<参数摘要>/<时间戳>/。
-        model_type="s",                         # 模型容量：当前为 1.5 倍宽度的 s；设置 model_type=n 可恢复原始基线。
+        model_type="s",                         # 模型容量：当前为 1.5 倍宽度的 s；xn/n 分别为 0.5×/1× 基线宽度。
         source_sample_limit=50000,              # 划分前按文件系统目录顺序仅取前 N 份完整序列；0 表示使用 data_root 下全部序列。
         batch_size_per_gpu=128,                 # 每张 GPU 的训练 micro-batch 大小。
         positive_fraction=0.25,                 # batch 内可见正样本比例，默认约为 1:3 正负比。
