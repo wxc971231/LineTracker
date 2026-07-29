@@ -107,7 +107,8 @@
                 "ASCEND_GLOBAL_LOG_LEVEL": "3"
             },
             "console": "integratedTerminal",
-            "justMyCode": false
+            "justMyCode": false,
+            "subProcess": false
         }
     ]
 }

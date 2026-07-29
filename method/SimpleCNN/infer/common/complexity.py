@@ -20,17 +20,6 @@ class ModelComplexity:
         """采用 1 MAC = 2 FLOPs 的常用口径。"""
         return self.conv_linear_macs_per_block * 2
 
-    def scale(self, blocks_evaluated: int) -> dict[str, int]:
-        if blocks_evaluated < 0:
-            raise ValueError("blocks_evaluated 不得为负。")
-        return {
-            "parameter_count": self.parameter_count,
-            "estimated_conv_linear_macs_per_block": self.conv_linear_macs_per_block,
-            "estimated_conv_linear_flops_per_block": self.conv_linear_flops_per_block,
-            "estimated_conv_linear_macs_total": self.conv_linear_macs_per_block * blocks_evaluated,
-            "estimated_conv_linear_flops_total": self.conv_linear_flops_per_block * blocks_evaluated,
-        }
-
 
 def _conv_output_size(
     input_size: int,
@@ -57,18 +46,16 @@ def estimate_model_complexity(
 
     for module in model.modules():
         if isinstance(module, nn.Conv2d):
-            if module.in_channels != channels:
-                raise ValueError(
-                    "卷积层通道与推导输入不一致；当前复杂度估算仅支持顺序 SimpleCNN 特征提取器。"
-                )
+            assert module.in_channels == channels, (
+                "卷积层通道与推导输入不一致；当前复杂度估算仅支持顺序 SimpleCNN 特征提取器。"
+            )
             kernel_h, kernel_w = module.kernel_size
             stride_h, stride_w = module.stride
             padding_h, padding_w = module.padding
             dilation_h, dilation_w = module.dilation
             height = _conv_output_size(height, kernel_h, stride_h, padding_h, dilation_h)
             width = _conv_output_size(width, kernel_w, stride_w, padding_w, dilation_w)
-            if height < 1 or width < 1:
-                raise ValueError("卷积输出空间尺寸无效。")
+            assert height >= 1 and width >= 1, "卷积输出空间尺寸无效。"
             macs += (
                 height
                 * width

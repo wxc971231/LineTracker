@@ -16,24 +16,12 @@ from eval.evaluator import autocast_context
 
 @dataclass(frozen=True)
 class BatchTiming:
-    """一次候选块批量推理的分阶段耗时，单位均为秒。"""
+    """一次候选块批量推理的实际工作量与关键耗时，单位为秒。"""
 
     preprocess_s: float
     model_s: float
-    postprocess_s: float
-    total_s: float
     forward_calls: int
     blocks_evaluated: int
-
-    def as_dict(self) -> dict[str, float | int]:
-        return {
-            "preprocess_s": self.preprocess_s,
-            "model_s": self.model_s,
-            "postprocess_s": self.postprocess_s,
-            "total_s": self.total_s,
-            "forward_calls": self.forward_calls,
-            "blocks_evaluated": self.blocks_evaluated,
-        }
 
 
 @dataclass(frozen=True)
@@ -48,8 +36,7 @@ class BatchPrediction:
 
     def __post_init__(self) -> None:
         count = int(self.range_starts_m.size)
-        if any(array.ndim != 1 or int(array.size) != count for array in (self.q, self.rho_m, self.nu_mpf)):
-            raise ValueError("批量预测的候选数组必须是一维且长度一致。")
+        assert all(array.ndim == 1 and int(array.size) == count for array in (self.q, self.rho_m, self.nu_mpf)), "批量预测的候选数组必须是一维且长度一致。"
 
 
 def synchronize_device(device: torch.device) -> None:
@@ -58,8 +45,7 @@ def synchronize_device(device: torch.device) -> None:
         torch.cuda.synchronize(device)
     elif device.type == "npu":
         npu = getattr(torch, "npu", None)
-        if npu is None:
-            raise RuntimeError("当前 device 为 NPU，但 torch.npu 未注册。")
+        assert npu is not None, "当前 device 为 NPU，但 torch.npu 未注册。"
         npu.synchronize()
 
 
@@ -74,8 +60,7 @@ class ModelRunner:
         *,
         max_blocks_per_forward: int = 0,
     ) -> None:
-        if max_blocks_per_forward < 0:
-            raise ValueError("max_blocks_per_forward 必须为非负整数；0 表示不拆分 batch。")
+        assert max_blocks_per_forward >= 0, "max_blocks_per_forward 必须为非负整数；0 表示不拆分 batch。"
         self.model = model
         self.config = config
         self.device = device
@@ -88,8 +73,7 @@ class ModelRunner:
         time_start: int,
         range_starts_m: Sequence[int],
     ) -> torch.Tensor:
-        if len(range_starts_m) == 0:
-            raise ValueError("至少需要一个距离块才能推理。")
+        assert len(range_starts_m) > 0, "至少需要一个距离块才能推理。"
         arrays = [
             rearrange_distance_channels(
                 source.extract_window(time_start, int(range_start), self.config),
@@ -114,20 +98,16 @@ class ModelRunner:
     ) -> BatchPrediction:
         """对给定时间窗和距离块集合前向；必要时按上限拆成多个小 batch。"""
         starts = np.asarray(tuple(int(item) for item in range_starts_m), dtype=np.int32)
-        if starts.ndim != 1 or starts.size == 0:
-            raise ValueError("range_starts_m 必须为非空一维距离块起点序列。")
+        assert starts.ndim == 1 and starts.size > 0, "range_starts_m 必须为非空一维距离块起点序列。"
         maximum_start = self.config.range_bins - self.config.block_width_m
-        if np.any(starts < 0) or np.any(starts > maximum_start):
-            raise IndexError("距离块起点超出有效范围。")
+        assert not (np.any(starts < 0) or np.any(starts > maximum_start)), "距离块起点超出有效范围。"
 
-        whole_start = perf_counter()
         split_size = self.max_blocks_per_forward or int(starts.size)
         q_values: list[np.ndarray] = []
         rho_values: list[np.ndarray] = []
         nu_values: list[np.ndarray] = []
         preprocess_s = 0.0
         model_s = 0.0
-        postprocess_s = 0.0
         forward_calls = 0
 
         for chunk_start in range(0, int(starts.size), split_size):
@@ -144,17 +124,13 @@ class ModelRunner:
             model_s += perf_counter() - model_start
             forward_calls += 1
 
-            phase_start = perf_counter()
             q_values.append(self._as_numpy(output, "q"))
             rho_values.append(self._as_numpy(output, "rho_m"))
             nu_values.append(self._as_numpy(output, "nu_mpf"))
-            postprocess_s += perf_counter() - phase_start
 
         timing = BatchTiming(
             preprocess_s=preprocess_s,
             model_s=model_s,
-            postprocess_s=postprocess_s,
-            total_s=perf_counter() - whole_start,
             forward_calls=forward_calls,
             blocks_evaluated=int(starts.size),
         )
@@ -170,15 +146,12 @@ class ModelRunner:
         self,
         source: PackedSource,
         *,
-        time_start: int = 0,
         range_starts_m: Sequence[int],
-        block_counts: Sequence[int] = (1, 3, 5, 34),
     ) -> None:
         """预热动态方法可能使用的 batch 尺寸；预热不计入任何样本统计。"""
         starts = tuple(int(item) for item in range_starts_m)
-        if not starts:
-            raise ValueError("预热需要至少一个可用距离块。")
-        for count in block_counts:
+        assert starts, "预热需要至少一个可用距离块。"
+        for count in (1, 3, 5, 34):  # 覆盖全局与 L0/L1/L2 的实际 batch 尺寸。
             if count < 1:
                 continue
-            self.predict_blocks(source, time_start, starts[: min(int(count), len(starts))])
+            self.predict_blocks(source, 0, starts[: min(int(count), len(starts))])

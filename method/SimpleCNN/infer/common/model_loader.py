@@ -43,11 +43,8 @@ class InferenceBundle:
     config: SimpleCNNConfig
     checkpoint: dict[str, Any]
     checkpoint_path: Path
-    run_dir: Path
     resolved_config_path: Path
     device: torch.device
-    runtime_settings: RuntimeSettings
-    npu_checkpoint_shim_installed: bool
 
 
 def install_torch_npu_checkpoint_shim() -> bool:
@@ -256,7 +253,6 @@ def load_inference_bundle(
     *,
     data_root: Path | str | None = None,
     device: str | torch.device | None = "auto",
-    env_file: Path | str | None = None,
 ) -> InferenceBundle:
     """从训练 run 恢复单进程推理模型。
 
@@ -265,23 +261,26 @@ def load_inference_bundle(
     为防止错配权重，该函数会验证 checkpoint 推断出的模型规格与配置一致。
     """
 
+    # 加载训练配置
     raw_checkpoint_path = Path(checkpoint_path).expanduser()
     run_dir = resolve_run_dir(raw_checkpoint_path)
     checkpoint_path = raw_checkpoint_path.resolve()
     resolved_config_path = run_dir / "resolved_config.json"
     config = load_resolved_config(run_dir)
 
-    normalized_env_file = None if env_file is None else Path(env_file)
-    runtime_settings = load_runtime_settings(normalized_env_file)
+    # 注入当前机器相关的路径、设备和数据加载设置项
+    runtime_settings = load_runtime_settings()
     config = apply_runtime_settings(config, runtime_settings)
     if data_root is not None:
         config.data_root = _normalize_data_root(data_root)
 
+    # 设备确定后，应用 CUDA/NPU 设置
     resolved_device = resolve_inference_device(device, runtime_settings=runtime_settings)
     config = apply_device_defaults(config, runtime_settings, resolved_device.type)
-    config.validate()
+    config.validate()   # 完整参数校验
 
-    shim_installed = install_torch_npu_checkpoint_shim()
+    # Ascend 保存的 checkpoint 可能引用 torch_npu 类型；在反序列化前安装兼容 shim。
+    install_torch_npu_checkpoint_shim()
     try:
         checkpoint = load_checkpoint(checkpoint_path, resolved_device)
     except Exception as error:
@@ -289,31 +288,28 @@ def load_inference_bundle(
     if not isinstance(checkpoint, dict):
         raise TypeError(f"checkpoint 顶层应为 dict，实际为 {type(checkpoint).__name__}。")
 
+    # 从 ckpt 加载模型
     inferred_model_type, state_dict = infer_model_type(checkpoint)
     if config.model_type != inferred_model_type:
         raise RuntimeError(
             "checkpoint 权重与所属 resolved_config.json 的模型规格不一致："
-            f"checkpoint={inferred_model_type!r}，config={config.model_type!r}。"
+            f"checkpoint={inferred_model_type!r}，config={config.model_type!r}"
         )
-
     model = SimpleCNN(config).to(resolved_device)
     try:
-        model.load_state_dict(state_dict, strict=True)
+        model.load_state_dict(state_dict, strict=True)  # strict=True 要求所有参数名和形状完全一致，避免静默遗漏权重后继续推理。
     except RuntimeError as error:
         raise RuntimeError(
             "checkpoint 参数形状与 resolved_config.json 不兼容；"
             "请确认 checkpoint 没有被放入错误的 run 目录。"
         ) from error
-    model.eval()
+    model.eval()    # 评估模式：关闭 Dropout、固定 BatchNorm 的推理行为；调用方无需再次切换模式。
 
     return InferenceBundle(
         model=model,
         config=config,
         checkpoint=checkpoint,
         checkpoint_path=checkpoint_path,
-        run_dir=run_dir,
         resolved_config_path=resolved_config_path,
         device=resolved_device,
-        runtime_settings=runtime_settings,
-        npu_checkpoint_shim_installed=shim_installed,
     )

@@ -9,14 +9,12 @@ postprocess.md 定义的自适应后处理。推理候选选择只依赖模型�
 from __future__ import annotations
 
 import argparse
-from collections import Counter
 from collections.abc import Mapping, Sequence
-from dataclasses import asdict
+import logging
 import math
 import re
 from pathlib import Path
 import sys
-from time import perf_counter
 from typing import Any, Callable
 
 import numpy as np
@@ -25,15 +23,15 @@ METHOD_ROOT = Path(__file__).resolve().parents[1]
 if str(METHOD_ROOT) not in sys.path:
     sys.path.insert(0, str(METHOD_ROOT))
 
+from configs.base import SimpleCNNConfig
 from data.dataloader import PackedSource, SourceRecord, discover_sources, standard_distance_starts
 from infer.adaptive_tracker.infer import AdaptiveInferenceConfig, run_source as run_adaptive_source
 from infer.common.complexity import ModelComplexity, estimate_model_complexity
-from infer.common.metrics import timing_metrics, timing_metrics_from_steps, trajectory_metrics
+from infer.common.metrics import timing_metrics_from_steps, trajectory_metrics
 from infer.common.model_loader import InferenceBundle, load_inference_bundle
 from infer.common.output import (
     configure_logger,
     create_output_dir,
-    read_json,
     safe_name,
     write_json,
     write_jsonl,
@@ -44,10 +42,6 @@ from infer.global_top1.infer import GlobalTop1Config, run_source as run_global_s
 from utils.process_title import set_process_title
 
 
-_METHOD_DIRS = {
-    "global_top1": "global_top1",
-    "adaptive_tracker": "adaptive_tracker",
-}
 _METHOD_TITLES = {
     "global_top1": "全局 34 块 Top-1 流式基线",
     "adaptive_tracker": "CAPTURE—TRACK—RECAPTURE 自适应推理",
@@ -87,12 +81,11 @@ def _finite_float(value: str) -> float:
 
 def _csv_values(raw: str, converter: Callable[[str], Any], name: str) -> tuple[Any, ...]:
     values = tuple(part.strip() for part in raw.split(",") if part.strip())
-    if not values:
-        raise ValueError(f"{name} 不能为空。")
+    assert values, f"{name} 不能为空。"
     try:
         return tuple(converter(part) for part in values)
     except (TypeError, ValueError) as error:
-        raise ValueError(f"{name} 应为逗号分隔的合法值：{raw!r}。") from error
+        raise AssertionError(f"{name} 应为逗号分隔的合法值：{raw!r}。") from error
 
 
 def _optional_number(value: object) -> float:
@@ -113,14 +106,13 @@ def _checkpoint_step(checkpoint: Mapping[str, Any]) -> int | str | None:
         return str(value)
 
 
-def _select_records(
-    bundle: InferenceBundle,
-    args: argparse.Namespace,
-) -> tuple[list[SourceRecord], dict[str, int]]:
-    records = discover_sources(bundle.config.data_root)
-    selected = sorted(records, key=lambda record: record.source_id)[: args.num_samples]
-    data_root_indices = {record.source_id: index for index, record in enumerate(selected)}
-    return selected, data_root_indices
+def _select_records(bundle: InferenceBundle, args: argparse.Namespace) -> list[SourceRecord]:
+    """稳定选取 data_root 按 source_id 排序后的前 N 个一级样本目录。"""
+    records = sorted(discover_sources(bundle.config.data_root), key=lambda record: record.source_id)
+    assert args.num_samples <= len(records), (
+        f"num_samples={args.num_samples} 超过 data_root 中可用样本数 {len(records)}。"
+    )
+    return records[: args.num_samples]
 
 
 def _sample_file_stem(method: str, time_stride: int) -> str:
@@ -136,47 +128,28 @@ def _figure_title(method: str, source_id: str, time_stride: int) -> str:
 def _method_config(args: argparse.Namespace) -> GlobalTop1Config | AdaptiveInferenceConfig:
     if args.method == "global_top1":
         return GlobalTop1Config(time_stride=args.time_stride)
-
-    gates = tuple(_csv_values(args.position_gates_m, float, "position_gates_m"))
-    if len(gates) != 3:
-        raise ValueError("position_gates_m 必须恰好提供 L=0/1/2 三个门限。")
-    return AdaptiveInferenceConfig(
-        time_stride=args.time_stride,
-        capture_stride=args.capture_stride,
-        capture_buffer_size=args.capture_buffer_size,
-        capture_support_ratio=args.capture_support_ratio,
-        capture_radius_m=args.capture_radius_m,
-        q_keep=args.q_keep,
-        position_gate_m=gates,
-        expand_after_bad=args.expand_after_bad,
-        shrink_after_good=args.shrink_after_good,
-        alpha=args.alpha,
-        beta=args.beta,
-        gamma=args.gamma,
-    )
-
-
-def _step_prediction_arrays(result: Mapping[str, Any]) -> tuple[np.ndarray, np.ndarray]:
-    frame_count = int(result["frame_count"])
-    current = np.full(frame_count, np.nan, dtype=np.float64)
-    next_frame = np.full(frame_count, np.nan, dtype=np.float64)
-    for step in result.get("steps", ()):
-        if not isinstance(step, Mapping):
-            continue
-        latest = step.get("latest_frame")
-        if latest is not None:
-            latest_index = int(latest)
-            value = _optional_number(step.get("range_current_m"))
-            if 0 <= latest_index < frame_count and math.isfinite(value):
-                current[latest_index] = value
-        forecast_start = step.get("forecast_frame_start")
-        value = _optional_number(step.get("range_next_m"))
-        if forecast_start is not None and math.isfinite(value):
-            next_index = int(forecast_start)
-            if 0 <= next_index < frame_count:
-                next_frame[next_index] = value
-    return current, next_frame
-
+    elif args.method == "adaptive_tracker":
+        instant_speed_gates = tuple(_csv_values(args.instant_speed_gates_mpf, float, "instant_speed_gates_mpf"))
+        average_speed_gates = tuple(_csv_values(args.average_speed_gates_mpf, float, "average_speed_gates_mpf"))
+        assert len(instant_speed_gates) == len(average_speed_gates) == 3, "两类 speed gates 都必须恰好提供 L=0/1/2 三个门限。"
+        return AdaptiveInferenceConfig(
+            time_stride=args.time_stride,
+            capture_stride=args.capture_stride,
+            capture_buffer_size=args.capture_buffer_size,
+            capture_support_ratio=args.capture_support_ratio,
+            capture_radius_m=args.capture_radius_m,
+            q_keep=args.q_keep,
+            instant_speed_gate_mpf=instant_speed_gates,
+            average_speed_gate_mpf=average_speed_gates,
+            speed_average_window_frames=args.speed_average_window_frames,
+            expand_after_bad=args.expand_after_bad,
+            shrink_after_good=args.shrink_after_good,
+            alpha=args.alpha,
+            beta=args.beta,
+            gamma=args.gamma,
+        )
+    else:
+        raise ValueError(f"不支持的推理方法：{args.method!r}。")
 
 def _trajectory_summary(
     result: Mapping[str, Any],
@@ -184,142 +157,157 @@ def _trajectory_summary(
     *,
     jump_threshold_m: float,
 ) -> dict[str, float | int]:
+    """计算最终拼接轨迹的离线质量指标。"""
     prediction = np.asarray(result["prediction_m"], dtype=np.float64)
-    truth = source.target_true_range_m
-    target_hit = source.target_hit
+    unreliable = np.asarray(result.get("unreliable_prediction_mask", np.zeros(prediction.shape, dtype=bool)), dtype=bool,)
+    assert unreliable.shape == prediction.shape, "unreliable_prediction_mask 必须与 prediction_m 同形状。"
     summary = trajectory_metrics(
         prediction,
-        truth,
-        target_hit=target_hit,
+        source.target_true_range_m,
+        target_hit=source.target_hit,
         jump_threshold_m=jump_threshold_m,
     )
-    current, next_frame = _step_prediction_arrays(result)
-    current_summary = trajectory_metrics(
-        current,
-        truth,
-        target_hit=target_hit,
-        jump_threshold_m=jump_threshold_m,
-    )
-    next_summary = trajectory_metrics(
-        next_frame,
-        truth,
-        target_hit=target_hit,
-        jump_threshold_m=jump_threshold_m,
-    )
-    for prefix, values in (("current_", current_summary), ("next_", next_summary)):
-        for key, value in values.items():
-            if key in {"frame_count", "jump_threshold_m"}:
-                continue
-            summary[f"{prefix}{key}"] = value
+    # 覆盖率仍表示全部输出；该字段单独量化其中仅由 RECAPTURE 外推补出的部分。
+    summary["unreliable_coverage"] = float(np.mean(unreliable & np.isfinite(prediction)))
     return summary
 
 
-def _timing_summary(result: Mapping[str, Any]) -> dict[str, float | int]:
+def _workload_summary(result: Mapping[str, Any]) -> dict[str, int]:
+    """提取随样本和推理方法变化的实际计算量。"""
+    workload = result.get("workload", {})
+    assert isinstance(workload, Mapping), "推理结果 workload 必须为字典。"
+    required_keys = ("logical_steps", "blocks_evaluated", "forward_calls")
+    missing = [key for key in required_keys if key not in workload]
+    assert not missing, f"推理结果 workload 缺少字段：{', '.join(missing)}。"
+    return {key: int(workload[key]) for key in required_keys}
+
+
+def _timing_summary(method: str, result: Mapping[str, Any]) -> dict[str, Any]:
+    """汇总样本时延及每个逻辑步的端到端耗时。"""
     steps = [step for step in result.get("steps", ()) if isinstance(step, Mapping)]
     workload = result.get("workload", {})
-    if not isinstance(workload, Mapping):
-        raise TypeError("推理结果 workload 必须为字典。")
+    assert isinstance(workload, Mapping), "推理结果 workload 必须为字典。"
+    required_keys = ("end_to_end_s", "preprocess_s", "model_s")
+    missing = [key for key in required_keys if key not in workload]
+    assert not missing, f"推理结果 workload 缺少字段：{', '.join(missing)}。"
 
-    end_to_end = timing_metrics_from_steps(steps, key="end_to_end_s")
-    model_per_forward = [
-        _optional_number(step.get("model_s")) / int(step["forward_calls"])
-        for step in steps
-        if int(step.get("forward_calls", 0)) > 0
-    ]
-    model_timing = timing_metrics(model_per_forward)
-    logical_steps = int(workload.get("logical_steps", len(steps)))
-    blocks = int(workload.get("blocks_evaluated", 0))
-    forwards = int(workload.get("forward_calls", 0))
+    end_to_end = timing_metrics_from_steps(steps)
     return {
-        "logical_steps": logical_steps,
-        "blocks_evaluated": blocks,
-        "forward_calls": forwards,
-        "avg_blocks_per_step": float(blocks / max(logical_steps, 1)),
-        "avg_forwards_per_step": float(forwards / max(logical_steps, 1)),
-        "end_to_end_total_s": _optional_number(workload.get("end_to_end_s")),
+        "end_to_end_total_s": _optional_number(workload["end_to_end_s"]),
         "end_to_end_mean_ms": 1000.0 * _optional_number(end_to_end["mean_s"]),
-        "end_to_end_p50_ms": 1000.0 * _optional_number(end_to_end["p50_s"]),
         "end_to_end_p95_ms": 1000.0 * _optional_number(end_to_end["p95_s"]),
-        "end_to_end_p99_ms": 1000.0 * _optional_number(end_to_end["p99_s"]),
-        "model_forward_mean_ms": 1000.0 * _optional_number(model_timing["mean_s"]),
-        "model_forward_p95_ms": 1000.0 * _optional_number(model_timing["p95_s"]),
-        "model_forward_p99_ms": 1000.0 * _optional_number(model_timing["p99_s"]),
-        "preprocess_total_s": _optional_number(workload.get("preprocess_s")),
-        "model_total_s": _optional_number(workload.get("model_s")),
-        "model_postprocess_total_s": _optional_number(workload.get("model_postprocess_s")),
+        "preprocess_total_s": _optional_number(workload["preprocess_s"]),
+        "model_total_s": _optional_number(workload["model_s"]),
+        "frame_ms": {
+            str(int(record["frame"])): {
+                "type": str(record["type"]),
+                "ms": _optional_number(record["ms"]),
+            }
+            for record in _frame_timing_records(method, result)
+        },
     }
 
 
-def _adaptive_summary(result: Mapping[str, Any]) -> dict[str, float | int]:
+def _frame_timing_type(method: str, step: Mapping[str, Any]) -> str:
+    """给每个逻辑预测步一个可比较的计算类型。"""
+    if method == "global_top1":
+        return "GLOBAL"
+    mode_before = str(step.get("mode_before", "")).upper()
+    if mode_before == "TRACK":
+        level = step.get("scan_level")
+        return "Track" if level is None else f"Track-L{int(level)}"
+    if mode_before == "RECAPTURE":
+        return "RECAPTURE"
+    return "CAPTURE"
+
+
+def _frame_timing_records(method: str, result: Mapping[str, Any]) -> list[dict[str, float | int | str]]:
+    """保留每个逻辑预测步的端到端耗时，供定位不同状态下的开销。"""
+    records: list[dict[str, float | int | str]] = []
+    for step in result.get("steps", ()):
+        if not isinstance(step, Mapping) or "frame" not in step:
+            continue
+        duration_s = _optional_number(step.get("end_to_end_s"))
+        records.append(
+            {
+                "frame": int(step["frame"]),
+                "type": _frame_timing_type(method, step),
+                "ms": 1_000.0 * duration_s,
+            }
+        )
+    return records
+
+
+def _adaptive_summary(
+    result: Mapping[str, Any],
+    *,
+    frames_per_window: int,
+) -> dict[str, float | int]:
+    """汇总自适应状态机中真正影响行为的捕获与搜索统计。"""
     steps = [step for step in result.get("steps", ()) if isinstance(step, Mapping)]
-    frames_per_window = int(result["frames_per_window"])
     initial_confirmations = [
         step
         for step in steps
-        if bool(step.get("capture_confirmed")) and step.get("mode_before") == "CAPTURE"
+        if bool(step.get("capture", {}).get("confirmed")) and step.get("mode_before") == "CAPTURE"
     ]
     recapture_starts = [
-        int(step["latest_frame"])
+        int(step["frame"])
         for step in steps
         if step.get("mode_before") == "TRACK" and step.get("mode") == "RECAPTURE"
     ]
     recapture_confirmations = [
-        int(step["latest_frame"])
+        int(step["frame"])
         for step in steps
-        if bool(step.get("capture_confirmed")) and step.get("mode_before") == "RECAPTURE"
+        if bool(step.get("capture", {}).get("confirmed")) and step.get("mode_before") == "RECAPTURE"
     ]
     recapture_delays: list[float] = []
     unused_confirmations = list(recapture_confirmations)
-    for start in recapture_starts:
-        after_start = next((frame for frame in unused_confirmations if frame > start), None)
+    for start_frame in recapture_starts:
+        after_start = next((frame for frame in unused_confirmations if frame > start_frame), None)
         if after_start is not None:
-            recapture_delays.append(float(after_start - start))
+            recapture_delays.append(float(after_start - start_frame))
             unused_confirmations.remove(after_start)
-    mode_counts = Counter(str(step.get("mode", "UNKNOWN")) for step in steps)
     first_delay = float("nan")
     if initial_confirmations:
-        first_delay = float(int(initial_confirmations[0]["latest_frame"]) - (frames_per_window - 1))
-    count = max(len(steps), 1)
+        first_delay = float(int(initial_confirmations[0]["frame"]) - (frames_per_window - 1))
     workload = result.get("workload", {})
     return {
         "capture_success": int(bool(initial_confirmations)),
         "first_capture_delay_frames": first_delay,
-        "first_capture_delay_s": first_delay * _FRAME_INTERVAL_S,
         "recapture_start_count": len(recapture_starts),
         "recapture_success_count": len(recapture_delays),
-        "recapture_success_rate": (
-            float(len(recapture_delays) / len(recapture_starts))
-            if recapture_starts else float("nan")
-        ),
         "recapture_delay_frames_mean": (
             float(np.mean(recapture_delays)) if recapture_delays else float("nan")
         ),
-        "recapture_delay_s_mean": (
-            float(np.mean(recapture_delays) * _FRAME_INTERVAL_S)
-            if recapture_delays
-            else float("nan")
-        ),
-        "capture_step_fraction": float(mode_counts["CAPTURE"] / count),
-        "track_step_fraction": float(mode_counts["TRACK"] / count),
-        "recapture_step_fraction": float(mode_counts["RECAPTURE"] / count),
         "capture_scan_count": int(workload.get("capture_scans", 0)),
         "local_scan_count": int(workload.get("local_scans", 0)),
     }
 
 
-def _complexity_summary(complexity: ModelComplexity, timing: Mapping[str, Any]) -> dict[str, int | float]:
-    blocks = int(timing["blocks_evaluated"])
-    values = complexity.scale(blocks)
-    values["estimated_conv_linear_macs_per_step"] = float(
-        values["estimated_conv_linear_macs_total"] / max(int(timing["logical_steps"]), 1)
-    )
-    values["estimated_conv_linear_flops_per_step"] = float(
-        values["estimated_conv_linear_flops_total"] / max(int(timing["logical_steps"]), 1)
-    )
-    return values
+def _static_model_complexity(complexity: ModelComplexity) -> dict[str, int]:
+    """根级配置中只保存一次的单块模型静态复杂度。"""
+    return {
+        "parameter_count": complexity.parameter_count,
+        "estimated_conv_linear_macs_per_block": complexity.conv_linear_macs_per_block,
+        "estimated_conv_linear_flops_per_block": complexity.conv_linear_flops_per_block,
+    }
 
 
-def _macro_average(rows: Sequence[Mapping[str, Any]]) -> dict[str, float | int]:
+def _sample_compute_summary(
+    complexity: ModelComplexity,
+    workload: Mapping[str, int],
+) -> dict[str, int]:
+    """保存实际扫描量和由其换算的总 MACs/FLOPs。"""
+    blocks = int(workload["blocks_evaluated"])
+    return {
+        **workload,
+        "estimated_conv_linear_macs_total": complexity.conv_linear_macs_per_block * blocks,
+        "estimated_conv_linear_flops_total": complexity.conv_linear_flops_per_block * blocks,
+    }
+
+
+def _compact_trajectory_summary(summary: Mapping[str, Any]) -> dict[str, float | int]:
+    """保留比较方法效果所需的主轨迹指标。"""
     keys = (
         "coverage",
         "mae_m",
@@ -328,21 +316,25 @@ def _macro_average(rows: Sequence[Mapping[str, Any]]) -> dict[str, float | int]:
         "hit_coverage",
         "hit_mae_m",
         "jump_count",
-        "current_mae_m",
-        "next_mae_m",
-        "avg_blocks_per_step",
-        "end_to_end_mean_ms",
-        "end_to_end_p95_ms",
-        "capture_success",
-        "recapture_success_rate",
+        "unreliable_coverage",
     )
-    summary: dict[str, float | int] = {"source_count": len(rows)}
-    for key in keys:
-        values = np.asarray([_optional_number(row.get(key)) for row in rows], dtype=np.float64)
-        finite = values[np.isfinite(values)]
-        if len(finite):
-            summary[f"macro_mean_{key}"] = float(np.mean(finite))
-    return summary
+    return {key: summary[key] for key in keys}
+
+
+def _compact_step_log(method: str, steps: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
+    """移除仅供内存诊断图使用的预测窗边界和逐步计时。"""
+    if method == "global_top1":
+        keys = (
+            "frame",                    # 当前时间窗的最新帧号。
+            "candidate_q",              # 全局 Top-1 距离块的目标置信度。
+            "candidate_block_start_m",  # Top-1 距离块在全局距离轴上的起点（米）。
+            "candidate_range_m",        # Top-1 直线外推到最新帧后的全局距离（米）。
+            "candidate_speed_mpf",      # Top-1 预测直线斜率，单位米/帧。
+        )
+        return [{key: step[key] for key in keys} for step in steps]
+
+    internal_keys = {"forecast_frame_start", "forecast_frame_stop", "end_to_end_s"}
+    return [{key: value for key, value in step.items() if key not in internal_keys} for step in steps]
 
 
 def _sample_directory(output_dir: Path, source_id: str) -> Path:
@@ -363,24 +355,20 @@ def _write_sample(
     method: str,
     result: Mapping[str, Any],
     source: PackedSource,
-    summary: Mapping[str, Any],
+    trajectory: Mapping[str, Any],
+    compute: Mapping[str, Any],
     timing: Mapping[str, Any],
-    complexity: Mapping[str, Any],
+    tracker: Mapping[str, Any],
     save_figures: bool,
     figure_dpi: int,
-    config: Any,
+    config: SimpleCNNConfig,
     time_stride: int,
     title: str,
-    logger: Any,
-) -> str | None:
-    """在方法目录写入固定文件名的图、数值、摘要和逐窗日志。"""
-    np.savez_compressed(
-        method_dir / "prediction.npz",
-        prediction_m=np.asarray(result["prediction_m"], dtype=np.float64),
-        target_true_range_m=source.target_true_range_m,
-        target_hit=source.target_hit,
-    )
-    write_jsonl(method_dir / "log.jsonl", list(result.get("steps", ())))
+    logger: logging.Logger,
+) -> None:
+    """写入精简的逐窗决策日志、样本摘要和可选诊断图。"""
+    steps = [step for step in result.get("steps", ()) if isinstance(step, Mapping)]
+    write_jsonl(method_dir / "log.jsonl", _compact_step_log(method, steps))
     figure_error: str | None = None
     if save_figures:
         try:
@@ -389,7 +377,7 @@ def _write_sample(
                 result,
                 config=config,
                 title=title,
-                metrics={**summary, **timing},
+                metrics={**trajectory, **timing, **tracker},
                 frame_interval_s=_FRAME_INTERVAL_S,
             )
             figure.savefig(method_dir / "visualize.png", dpi=figure_dpi)
@@ -400,171 +388,123 @@ def _write_sample(
             figure_error = f"{type(error).__name__}: {error}"
             logger.exception("样本 %s 的诊断图保存失败。", source.record.source_id)
 
-    write_json(
-        method_dir / "metrics.json",
-        {
-            "source_id": source.record.source_id,
-            "method": method,
-            "time_stride": time_stride,
-            "metrics": summary,
-            "timing": timing,
-            "complexity": complexity,
-            "result": {
-                key: value for key, value in result.items()
-                if key not in {"prediction_m", "steps"}
-            },
-            "figure_error": figure_error,
-        },
-    )
-    return figure_error
+    payload: dict[str, Any] = {
+        "schema_version": 5,
+        "source_id": source.record.source_id,
+        "method": method,
+        "time_stride": time_stride,
+        "trajectory": trajectory,
+        "compute": compute,
+        "timing": timing,
+    }
+    if tracker:
+        payload["tracker"] = tracker
+    if figure_error is not None:
+        payload["figure_error"] = figure_error
+    write_json(method_dir / "metrics.json", payload)
 
 
 def run(args: argparse.Namespace) -> Path:
+    """执行一个方法在前 N 个数据源上的单进程推理，并增量写入统一输出目录。"""
+    assert args.method in _METHOD_TITLES, f"不支持的推理方法：{args.method!r}。"
+    assert args.jump_threshold_m >= 0.0, "jump_threshold_m 必须为非负数。"
     method_config = _method_config(args)
-    if args.jump_threshold_m < 0.0:
-        raise ValueError("jump_threshold_m 必须为非负数。")
+
+    # 加载 checkpoint 所属 run 恢复结构配置与权重。
     bundle = load_inference_bundle(
         args.checkpoint,
         data_root=args.data_root,
         device=args.device,
     )
-    checkpoint_step = _checkpoint_step(bundle.checkpoint)
-    output_dir = create_output_dir(
-        data_root=bundle.config.data_root,
-        checkpoint_path=bundle.checkpoint_path,
-        checkpoint_step=checkpoint_step,
-    )
-    logger = configure_logger(f"{args.method}-{bundle.checkpoint_path.stem}")
-    set_process_title(
-        "infer",
-        label=f"{args.method}-{bundle.checkpoint_path.stem}",
-        infer_rank=False,
-    )
+    set_process_title("infer", label=f"{args.method}-{bundle.checkpoint_path.stem}", infer_rank=False)
+    tracker_config = None
+    if isinstance(method_config, AdaptiveInferenceConfig):
+        tracker_config = method_config.validate(bundle.config)  # 配置校验和构造只执行一次。
+    else:
+        method_config.validate()
 
-    selected_records, data_root_indices = _select_records(bundle, args)
-    runner = ModelRunner(
-        bundle.model,
-        bundle.config,
-        bundle.device,
-        max_blocks_per_forward=args.max_blocks_per_forward,
-    )
+    # 只计算一次模型静态复杂度，每个样本再按实际扫描块数换算总 MACs/FLOPs。
     complexity = estimate_model_complexity(
         bundle.model,
         input_channels=bundle.config.input_channels,
         input_height=bundle.config.frames_per_window,
         input_width=bundle.config.block_width_m // bundle.config.input_channels,
     )
-    config_path = output_dir / "infer_config.json"
-    existing_config = read_json(config_path)
-    if existing_config is not None:
-        if (
-            str(existing_config.get("checkpoint_path")) != str(bundle.checkpoint_path)
-            or str(existing_config.get("data_root")) != str(bundle.config.data_root)
-        ):
-            raise ValueError(
-                "输出目录已被其他数据集或 checkpoint 占用，拒绝混写："
-                f"{config_path}"
-            )
-        infer_config = existing_config
-    else:
-        infer_config = {
-            "schema_version": 2,
-            "checkpoint_path": bundle.checkpoint_path,
-            "checkpoint_global_step": checkpoint_step,
-            "run_dir": bundle.run_dir,
-            "resolved_config_path": bundle.resolved_config_path,
-            "data_root": bundle.config.data_root,
-            "source_selection": "data_root_prefix",
-            "effective_config": asdict(bundle.config),
-            "methods": {},
-        }
-    methods = infer_config.setdefault("methods", {})
-    if not isinstance(methods, dict):
-        raise ValueError(f"已有推理配置格式错误：{config_path}")
-    method_file_stem = _sample_file_stem(args.method, args.time_stride)
-    method_run: dict[str, Any] = {
-        "title": _METHOD_TITLES[args.method],
-        "device": str(bundle.device),
-        "requested_num_samples": args.num_samples,
-        "selected_source_ids": [record.source_id for record in selected_records],
-        "arguments": vars(args),
-        "method_config": asdict(method_config),
-        "frame_interval_s": _FRAME_INTERVAL_S,
-        "model_complexity_per_block": complexity.scale(1),
-        "output_directory": method_file_stem,
-        "files": {
-            "visualization": "visualize.png",
-            "prediction": "prediction.npz",
-            "metrics": "metrics.json",
-            "step_log": "log.jsonl",
-        },
-        "warmup": {"enabled": bool(args.warmup), "elapsed_s": None},
-        "status": "running",
-    }
-    methods[args.method] = method_run
-    write_json(config_path, infer_config)
 
+    # 保存推理方法无关的数据/模型配置
+    checkpoint_step = _checkpoint_step(bundle.checkpoint)
+    output_dir = create_output_dir(
+        data_root=bundle.config.data_root,
+        checkpoint_path=bundle.checkpoint_path,
+        checkpoint_step=checkpoint_step,
+    )
+    config_path = output_dir / "_infer_config.json"
+    if not config_path.exists():
+        write_json(
+            config_path,
+            {
+                "schema_version": 5,
+                "checkpoint_path": bundle.checkpoint_path,
+                "checkpoint_global_step": checkpoint_step,
+                "resolved_config_path": bundle.resolved_config_path,
+                "data_root": bundle.config.data_root,
+                "model_complexity_per_block": _static_model_complexity(complexity),
+            },
+        )
+
+    # 加载评估数据和推理执行器
+    selected_records = _select_records(bundle, args)
+    runner = ModelRunner(
+        bundle.model,
+        bundle.config,
+        bundle.device,
+        max_blocks_per_forward=args.max_blocks_per_forward,
+    )
+
+    # 预热：让 NPU/CUDA 完成算子编译、内存分配和缓存初始化，不计推理时间
     first_source: PackedSource | None = None
     if args.warmup:
         first_source = PackedSource(selected_records[0], bundle.config)
-        warmup_start = perf_counter()
-        runner.warmup(
-            first_source,
-            range_starts_m=standard_distance_starts(bundle.config),
-        )
-        method_run["warmup"]["elapsed_s"] = perf_counter() - warmup_start
-        write_json(config_path, infer_config)
+        runner.warmup(first_source, range_starts_m=standard_distance_starts(bundle.config))
 
-    logger.info(
-        "开始 %s：device=%s checkpoint_step=%s data_root=%s sources=%d output=%s",
-        _METHOD_TITLES[args.method],
-        bundle.device,
-        checkpoint_step,
-        bundle.config.data_root,
-        len(selected_records),
-        output_dir,
-    )
-    rows: list[dict[str, Any]] = []
-    sample_summaries: list[dict[str, Any]] = []
+    # 启动逐样本评估
+    logger = configure_logger(f"{args.method}-{bundle.checkpoint_path.stem}")
+    logger.info("开始 %s：device=%s", _METHOD_TITLES[args.method], bundle.device)
     for selected_offset, record in enumerate(selected_records):
+        # 仅复用预热时的第一个 PackedSource；其余样本按需加载，控制峰值内存
         source = first_source if selected_offset == 0 and first_source is not None else PackedSource(record, bundle.config)
+
+        # 完成样本推理。两种方法共享模型、数据和输出协议，仅在流式候选选择/状态机实现上分叉。
         if args.method == "global_top1":
             result = run_global_source(source, runner, bundle.config, method_config)
         else:
-            result = run_adaptive_source(source, runner, bundle.config, method_config)
-        if not isinstance(result, Mapping):
-            raise TypeError("方法 run_source 必须返回字典。")
+            assert isinstance(method_config, AdaptiveInferenceConfig) and tracker_config is not None
+            result = run_adaptive_source(source, runner, bundle.config, method_config, tracker_config)
+        assert isinstance(result, Mapping), "方法 run_source 必须返回字典。"
 
-        metric = _trajectory_summary(
-            result,
-            source,
-            jump_threshold_m=args.jump_threshold_m,
+        # 统计推理指标
+        trajectory = _compact_trajectory_summary(               # 预测轨迹质量指标
+            _trajectory_summary(result, source, jump_threshold_m=args.jump_threshold_m)
         )
-        timing = _timing_summary(result)
-        method_metrics: dict[str, float | int] = {}
+        workload = _workload_summary(result)                    # 实际扫描块数与前向次数
+        timing = _timing_summary(args.method, result)           # 样本级时延指标
+        compute = _sample_compute_summary(complexity, workload) # 计算量指标
+        tracker: dict[str, float | int] = {}                    # 推理运行log
         if args.method == "adaptive_tracker":
-            method_metrics = _adaptive_summary(result)
-        complexity_metrics = _complexity_summary(complexity, timing)
-        data_root_index = data_root_indices[record.source_id]
+            tracker = _adaptive_summary(result, frames_per_window=bundle.config.frames_per_window)
+
+        # 每个样本独立落盘，包含精简日志、指标、预测数组和可选诊断图；
         sample_dir = _sample_directory(output_dir, record.source_id)
-        row: dict[str, Any] = {
-            "source_id": record.source_id,
-            "data_root_index": data_root_index,
-            "method": args.method,
-            **metric,
-            **timing,
-            **method_metrics,
-            **complexity_metrics,
-        }
         method_dir = _method_directory(sample_dir, args.method, args.time_stride)
-        figure_error = _write_sample(
+        _write_sample(
             method_dir,
             method=args.method,
             result=result,
             source=source,
-            summary={**metric, **method_metrics},
+            trajectory=trajectory,
+            compute=compute,
             timing=timing,
-            complexity=complexity_metrics,
+            tracker=tracker,
             save_figures=args.save_figures,
             figure_dpi=args.figure_dpi,
             config=bundle.config,
@@ -572,118 +512,169 @@ def run(args: argparse.Namespace) -> Path:
             title=_figure_title(args.method, record.source_id, args.time_stride),
             logger=logger,
         )
-        if figure_error is not None:
-            row["figure_error"] = figure_error
-        rows.append(row)
-        sample_summaries.append(
-            {
-                "source_id": record.source_id,
-                "data_root_index": data_root_index,
-                "directory": method_dir.relative_to(output_dir),
-                "result": {
-                    key: value for key, value in result.items()
-                    if key not in {"prediction_m", "steps"}
-                },
-                **row,
-            }
-        )
         logger.info(
-            "[%d/%d] source=%s coverage=%.1f%% mae=%s m blocks/step=%.2f p95=%.2f ms",
+            "[%d/%d] source=%s coverage=%.1f%% mae=%s m blocks=%d p95=%.2f ms",
             selected_offset + 1,
             len(selected_records),
             record.source_id,
-            100.0 * float(metric["coverage"]),
-            "—" if not math.isfinite(_optional_number(metric["mae_m"])) else f"{float(metric['mae_m']):.2f}",
-            float(timing["avg_blocks_per_step"]),
+            100.0 * float(trajectory["coverage"]),
+            "—" if not math.isfinite(_optional_number(trajectory["mae_m"])) else f"{float(trajectory['mae_m']):.2f}",
+            int(compute["blocks_evaluated"]),
             _optional_number(timing["end_to_end_p95_ms"]),
         )
 
-    method_run.update(
-        {
-            "status": "complete",
-            "source_count": len(rows),
-            "aggregate": _macro_average(rows),
-            "samples": sample_summaries,
-        }
-    )
-    write_json(config_path, infer_config)
-    logger.info("推理完成：%d 个样本，汇总已写入 %s", len(rows), config_path)
+    logger.info("推理完成：%d 个样本，结果已写入 %s", len(selected_records), output_dir)
     return output_dir
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description=("加载 checkpoint 后，从当前 data_root 的前 N 个序列执行 SimpleCNN 单进程流式推理。"),
+        description="加载 checkpoint 后，从当前 data_root 的前 N 个序列执行 SimpleCNN 单进程流式推理。",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    parser.add_argument("--method", choices=tuple(_METHOD_DIRS), default="global_top1",
-        help="推理算法：全局 Top-1 基线或 postprocess.md 自适应状态机。",
+    parser.add_argument(
+        "--method",
+        choices=tuple(_METHOD_TITLES),
+        default="global_top1",
+        help="推理方法。",
     )
-    parser.add_argument("--checkpoint", type=Path, default=Path("/mnt/host-model/weixc/code/LineTracker/method/SimpleCNN/runs/simplecnn_v2/limit50k-gbs1024-lr5e-4-pos25-vs5-modeln-cfgc5fe62b8/20260727_195332/checkpoints/best.pt"),
-        help="训练 run 内 checkpoints/ 下的 .pt 文件，例如 best.pt 或 last.pt。",
+    parser.add_argument(
+        "--checkpoint",
+        type=Path,
+        default=Path("/mnt/host-model/weixc/code/LineTracker/method/SimpleCNN/runs/simplecnn_v2/limit50k-gbs1024-lr5e-4-pos25-vs5-modeln-cfgc5fe62b8/20260727_195332/checkpoints/best.pt"),
+        help="要加载的 best.pt 或 last.pt。",
     )
-    parser.add_argument("--data-root", type=Path, default=Path("/mnt/host-model/weixc/code/LineTracker/data/synthetic/gen/F300_N10000_S42_B-random_T-R10000-290000m-V340-A6-C10-J1-K300-Q0p35-0p95"),
-        help="当前机器的数据根目录；可覆盖默认实验数据集。",
+    parser.add_argument(
+        "--data-root",
+        type=Path,
+        default=Path("/mnt/host-model/weixc/code/LineTracker/data/synthetic/gen/F300_N10000_S42_B-random_T-R10000-290000m-V340-A6-C10-J1-K300-Q0p35-0p95"),
+        help="当前机器上的一级样本目录根路径。",
     )
-    parser.add_argument("--device", default="auto",
+    parser.add_argument(
+        "--num-samples",
+        type=_positive_int,
+        default=10,
+        help="按 source_id 排序后取 data_root 前 N 个样本。",
+    )
+    parser.add_argument(
+        "--device",
+        default="auto",
         help="auto、cpu、cuda[:index] 或 npu[:index]；单次推理只使用一张卡。",
     )
-    parser.add_argument("--time-stride", type=_positive_int, default=5,
-        help="TRACK 和全局基线每次用前20帧外推的未来帧数，也是 TRACK 滑窗步进。",
+    parser.add_argument(
+        "--time-stride",
+        type=_positive_int,
+        default=5,
+        help="每个输入窗向未来外推的帧数，也是 TRACK 滑窗步进。",
     )
-    parser.add_argument("--max-blocks-per-forward", type=_nonnegative_int, default=0,
+    parser.add_argument(
+        "--max-blocks-per-forward",
+        type=_nonnegative_int,
+        default=0,
         help="单次模型前向最多拼多少距离块；0 表示同一步的所有候选一次前向。",
     )
-    parser.add_argument("--jump-threshold-m", type=_finite_float, default=1000.0,
-        help="离线统计预测相邻帧距离跳变的阈值（米）。",
+    parser.add_argument(
+        "--jump-threshold-m",
+        type=_finite_float,
+        default=1000.0,
+        help="离线统计相邻预测帧距离跳变的阈值（米）。",
     )
-    parser.add_argument("--figure-dpi", type=_positive_int, default=180,
+    parser.add_argument(
+        "--warmup",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="预热 1/3/5/34 个距离块；预热耗时不计入样本时延。",
+    )
+    parser.add_argument(
+        "--figure-dpi",
+        type=_positive_int,
+        default=180,
         help="每个样本 2×2 诊断图的保存分辨率。",
     )
-    parser.add_argument("--warmup", action=argparse.BooleanOptionalAction, default=True,
-        help="是否启用 1/3/5/34 块的模型预热；预热耗时不计入样本时延统计。",
-    )
-    parser.add_argument("--figures", action=argparse.BooleanOptionalAction, dest="save_figures", default=True,
+    parser.add_argument(
+        "--figures",
+        action=argparse.BooleanOptionalAction,
+        dest="save_figures",
+        default=True,
         help="是否生成每个样本的中文 2×2 诊断图。",
     )
 
-    parser.add_argument("--num-samples", type=_positive_int, default=10,
-        help="从 data_root 的一级序列目录按返回顺序取前 N 个 data.npz。",
-    )
-
     adaptive = parser.add_argument_group("adaptive_tracker 参数（仅 --method adaptive_tracker 生效）")
-    adaptive.add_argument("--capture-stride", type=_positive_int, default=3,
-        help="CAPTURE/RECAPTURE 阶段相邻全局扫描窗口的时间步进（帧）。",
+    adaptive.add_argument(
+        "--capture-stride",
+        type=_positive_int,
+        default=2,
+        help="CAPTURE/RECAPTURE 相邻全局扫描窗口的时间步进（帧）。",
     )
-    adaptive.add_argument("--capture-buffer-size", type=_positive_int, default=8,
-        help="用于稳定捕获判断的连续全局扫描候选数量。",
+    adaptive.add_argument(
+        "--capture-buffer-size",
+        type=_positive_int,
+        default=8,
+        help="稳定捕获判断使用的连续全局扫描候选数量。",
     )
-    adaptive.add_argument("--capture-support-ratio", type=_finite_float, default=0.7,
+    adaptive.add_argument(
+        "--capture-support-ratio",
+        type=_finite_float,
+        default=0.7,
         help="捕获成功所需的候选支持比例，取值必须在 (0, 1] 内。",
     )
-    adaptive.add_argument("--capture-radius-m", type=_finite_float, default=500.0,
-        help="CAPTURE/RECAPTURE 中候选聚类时的距离半径（米）。",
+    adaptive.add_argument(
+        "--capture-radius-m",
+        type=_finite_float,
+        default=500.0,
+        help="CAPTURE/RECAPTURE 候选聚类半径（米）。",
     )
-    adaptive.add_argument("--q-keep", type=_finite_float, default=0.5,
-        help="保留候选与判定跟踪成功所需的最低预测 q 值。",
+    adaptive.add_argument(
+        "--q-keep",
+        type=_finite_float,
+        default=0.5,
+        help="保留候选并判定跟踪成功所需的最低预测 q 值。",
     )
-    adaptive.add_argument("--position-gates-m", default="1000,2000,4000",
-        help="L=0/1/2 的位置连续性门限（米），以逗号分隔三个值。",
+    adaptive.add_argument(
+        "--instant-speed-gates-mpf",
+        default="20,25,30",
+        help="L=0/1/2 的单帧融合状态绝对速度上限（米/帧）。",
     )
-    adaptive.add_argument("--expand-after-bad", type=_positive_int, default=2,
+    adaptive.add_argument(
+        "--average-speed-gates-mpf",
+        default="17,25,34",
+        help="L=0/1/2 的最近 N 帧状态位移平均速度上限（米/帧）。",
+    )
+    adaptive.add_argument(
+        "--speed-average-window-frames",
+        type=_positive_int,
+        default=10,
+        help="平均速度门控的历史窗口长度（帧）。",
+    )
+    adaptive.add_argument(
+        "--expand-after-bad",
+        type=_positive_int,
+        default=2,
         help="连续失败达到该次数后，将局部搜索等级扩大一级。",
     )
-    adaptive.add_argument("--shrink-after-good", type=_positive_int, default=4,
+    adaptive.add_argument(
+        "--shrink-after-good",
+        type=_positive_int,
+        default=4,
         help="连续成功达到该次数后，将局部搜索等级缩小一级。",
     )
-    adaptive.add_argument("--alpha", type=_finite_float, default=0.8,
+    adaptive.add_argument(
+        "--alpha",
+        type=_finite_float,
+        default=0.8,
         help="α-β 预测器的位置更新系数 α，取值必须在 [0, 1] 内。",
     )
-    adaptive.add_argument("--beta", type=_finite_float, default=0.1,
+    adaptive.add_argument(
+        "--beta",
+        type=_finite_float,
+        default=0.1,
         help="α-β 预测器的速度更新系数 β，必须非负。",
     )
-    adaptive.add_argument("--gamma", type=_finite_float, default=0.0,
-        help="运动连续性评分中 q 与残差的融合权重 γ，取值必须在 [0, 1] 内。",
+    adaptive.add_argument(
+        "--gamma",
+        type=_finite_float,
+        default=0.0,
+        help="候选速度与 α-β 速度融合权重 γ，取值必须在 [0, 1] 内。",
     )
     return parser
 
@@ -692,6 +683,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     args.method = 'adaptive_tracker'
+    args.time_stride = 5
+    args.num_samples = 5000
 
     try:
         run(args)
@@ -703,4 +696,3 @@ def main(argv: Sequence[str] | None = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

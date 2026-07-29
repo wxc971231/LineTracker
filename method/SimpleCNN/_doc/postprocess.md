@@ -341,10 +341,19 @@ r_{t-\Delta t}
 +\Delta t\,\nu_{t-\Delta t},
 $$
 
-CNN 对当前局部块给出 Top-1 候选，其最新帧距离为 $\hat z_t$，设两者之差为：$e_t=\hat z_t-r_t^-$，当且仅当以下条件满足时认为本次 CNN 候选可信
-- $\hat q_t\ge q_{\mathrm{keep}}$：目标存在置信度超过阈值，CNN 自己认为该块确有目标
-- $|e_t|\le G_r(L)$：该候选不能相对预测轨迹突然跳得太远，$G_r(L)$ 是允许的位置偏差。搜索等级 $L$ 越高，说明原本的局部区域越不可靠，允许的偏差可以适当增大
-- $|\hat\nu_t-\nu_t^-|\le G_\nu$：斜率一致性作为附加软条件，暂时只考察不拒绝
+CNN 对当前局部块给出 Top-1 候选，其最新帧距离为 $\hat z_t$，设两者之差为：$e_t=\hat z_t-r_t^-$。先按第 5.4 节计算候选融合后的暂定状态 $(r_t^+,\nu_t^+)$；当且仅当以下条件满足时认为本次 CNN 候选可信：
+- $\hat q_t\ge q_{\mathrm{keep}}$：目标存在置信度超过阈值，CNN 自己认为该块确有目标；
+- $|\nu_t^+|\le V_{\mathrm{inst}}(L)$：单帧融合状态的绝对速度不超过当前搜索等级的上限；
+- 当 TRACK 历史已覆盖至少 $N_{\mathrm{avg}}$ 帧时，取不晚于 $t-N_{\mathrm{avg}}$ 的最近状态锚点 $(t_0,r_{t_0})$，并要求
+
+$$
+\left|\bar\nu_{t,N}\right|
+=
+\left|\frac{r_t^+-r_{t_0}}{t-t_0}\right|
+\le V_{\mathrm{avg}}(L).
+$$
+
+两类速度均以米/帧计，并使用真实帧号之差，而不是推理步数；因此相同参数在不同 `time_stride` 下对应相同的物理速度语义。历史不足 $N_{\mathrm{avg}}$ 帧时，仅使用单帧速度门控。
 
 
 无论远距离候选的 $\hat q$ 多高，只要没有通过运动连续性门控，就不能立即把轨迹状态跳转过去。
@@ -399,7 +408,7 @@ $$
 
 ### 6.1 扩大条件
 
-第 5.3 节的门控未通过，即 $\hat q_t<q_{\mathrm{keep}}$ 或 $|e_t|>G_r(L)$ 时，累计一次失败并清零连续有效计数。连续失败达到 $N_{\mathrm{expand}}$ 时，若 $L<2$，则：
+第 5.3 节的门控未通过，即 $\hat q_t<q_{\mathrm{keep}}$、$|\nu_t^+|>V_{\mathrm{inst}}(L)$，或历史充分时 $|\bar\nu_{t,N}|>V_{\mathrm{avg}}(L)$，累计一次失败并清零连续有效计数。连续失败达到 $N_{\mathrm{expand}}$ 时，若 $L<2$，则：
 
 $$
 L\leftarrow L+1,
@@ -444,7 +453,7 @@ $$
 3. 按第 4.2 节进行运动补偿，并按第 4.3 节的“中位捕获位置 + 支持数”确认新轨迹；
 4. 确认成功后，按第 4.3 节初始化状态并进入 `TRACK`。
 
-因此，`RECAPTURE` 与冷启动 `CAPTURE` 的计算逻辑相同，只是前者在输出和评估中标记为“丢失后的重新捕获”。重捕获期间不再输出旧轨迹外推位置，`range_current_m` 和 `range_next_m` 均返回空值。
+因此，`RECAPTURE` 与冷启动 `CAPTURE` 的全局扫描和确认逻辑相同，只是前者在输出和评估中标记为“丢失后的重新捕获”。状态机本身的 `range_current_m` 和 `range_next_m` 均为空；运行入口可将丢失前最后可靠状态匀速外推为临时输出，并显式标记为不可靠，且绝不将其回灌给重捕获决策。
 
 ---
 
@@ -463,8 +472,6 @@ $$
     "measurement_updated": ...,  # 本步是否接受了 CNN 测量
     "search_level": ...,         # 当前局部搜索等级
     "blocks_evaluated": ...,     # 本步实际推理块数
-    "good_count": ...,
-    "bad_count": ...,
 }
 ```
 
@@ -489,7 +496,9 @@ $$
 | $\eta_{\mathrm{cap}}$ | 0.6～0.8 | 中位捕获位置的最小支持比例 |
 | $R_{\mathrm{cap}}$ | 由验证集标定 | 外推位置相对中位捕获位置的一致性半径 |
 | $q_{\mathrm{keep}}$ | 由验证集标定 | 接受局部 CNN 候选的最低分类分数 |
-| $G_r(0),G_r(1),G_r(2)$ | 由验证集标定 | 三个局部搜索等级的位置连续性门限 |
+| $V_{\mathrm{inst}}(0),V_{\mathrm{inst}}(1),V_{\mathrm{inst}}(2)$ | 由验证集标定 | 三个局部搜索等级的单帧融合状态绝对速度门限（米/帧） |
+| $V_{\mathrm{avg}}(0),V_{\mathrm{avg}}(1),V_{\mathrm{avg}}(2)$ | 由验证集标定 | 三个局部搜索等级的最近历史平均速度门限（米/帧） |
+| $N_{\mathrm{avg}}$ | 20 帧 | 平均速度门控的最短历史跨度 |
 | $N_{\mathrm{expand}}$ | 1～2 | 扩大局部范围所需连续失败数 |
 | $N_{\mathrm{shrink}}$ | 3～5 | 缩小局部范围所需连续强有效数 |
 | $\alpha$ | 0.6～0.9 | 位置测量更新强度 |
@@ -504,7 +513,7 @@ $q_{\mathrm{keep}}$ 不应直接解释为真实概率。训练时人为设置了
 - 全局 Top-1 为真实目标块时的比例；
 - 距离误差和斜率误差的 P50、P90、P95、P99。
 
-距离门限 $R_{\mathrm{cap}}$ 和 $G_r(L)$ 应优先根据距离误差分位数设置，而不是只根据目标最大速度设置。运动模型已经补偿了正常位移，门限主要覆盖 CNN 的测量误差和短时模型误差。
+距离门限 $R_{\mathrm{cap}}$ 应根据距离误差分位数设置；$V_{\mathrm{inst}}(L)$ 与 $V_{\mathrm{avg}}(L)$ 应结合目标速度上限和验证集状态速度分布标定。运动模型已经补偿了正常位移，速度门限主要阻止 CNN 局部噪声将状态带入不合理运动。
 
 ---
 
@@ -512,14 +521,13 @@ $q_{\mathrm{keep}}$ 不应直接解释为真实概率。训练时人为设置了
 
 ```python
 if mode in ("CAPTURE", "RECAPTURE"):
-    if capture_scan_due:
-        candidate = global_q_top1(last_20_frames)
-        capture_buffer.append(candidate)
-        capture = median_capture_with_support(capture_buffer)
+    candidate = global_q_top1(last_20_frames)
+    capture_buffer.append(candidate)
+    capture = median_capture_with_support(capture_buffer)
 
-        if capture_is_confirmed(capture):
-            state = initialize_track(capture)
-            mode = "TRACK"
+    if capture_is_confirmed(capture):
+        state = initialize_track(capture)
+        mode = "TRACK"
 
 elif mode == "TRACK":
     prediction = motion_predict(state)

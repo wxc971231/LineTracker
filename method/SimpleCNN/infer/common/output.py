@@ -99,14 +99,6 @@ def write_json(path: Path, payload: Any) -> None:
     temporary.replace(path)
 
 
-def read_json(path: Path) -> dict[str, Any] | None:
-    """读取已有的推理配置；不存在时返回 None。"""
-    if not path.is_file():
-        return None
-    payload = json.loads(path.read_text(encoding="utf-8"))
-    return payload if isinstance(payload, dict) else None
-
-
 def write_jsonl(path: Path, records: list[dict[str, Any]]) -> None:
     """逐步写入 JSONL，保留每种方法的逐窗推理日志。"""
     path.parent.mkdir(parents=True, exist_ok=True)

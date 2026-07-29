@@ -1,9 +1,8 @@
 """严格按 ``_doc/postprocess.md`` 实现的纯 NumPy 捕获—跟踪状态机。
 
 本模块不读取原始二值时距图、也不调用 PyTorch 模型。调用方负责把一次
-CNN batch 的 q-Top1 转换为 :class:`Candidate`，并将实际送入模型的块数
-传给 :meth:`AdaptiveTracker.step`。这样状态机可独立测试，也可同时服务于
-CPU、CUDA 与 Ascend NPU 推理入口。
+CNN batch 的 q-Top1 转换为 :class:`Candidate` 后传给 :meth:`AdaptiveTracker.step`。
+这样状态机可独立测试，也可同时服务于 CPU、CUDA 与 Ascend NPU 推理入口。
 """
 
 from __future__ import annotations
@@ -12,18 +11,14 @@ from collections import deque
 from dataclasses import dataclass
 from enum import Enum
 import math
-from typing import Sequence
-
 import numpy as np
 
 
 class TrackerMode(str, Enum):
     """后处理的三个工作状态。"""
-
     CAPTURE = "CAPTURE"
     TRACK = "TRACK"
     RECAPTURE = "RECAPTURE"
-
 
 def _is_finite_number(value: object) -> bool:
     """仅接受可转换为有限 float 的标量，防止 NaN/Inf 污染状态。"""
@@ -32,22 +27,16 @@ def _is_finite_number(value: object) -> bool:
     except (TypeError, ValueError):
         return False
 
-
 def _as_finite_or_none(value: float) -> float | None:
     return float(value) if _is_finite_number(value) else None
 
-
 def _require_positive_int(name: str, value: object) -> int:
-    if isinstance(value, bool) or not isinstance(value, (int, np.integer)) or int(value) <= 0:
-        raise ValueError(f"{name} 必须是正整数，实际为 {value!r}。")
+    assert not isinstance(value, bool) and isinstance(value, (int, np.integer)) and int(value) > 0, f"{name} 必须是正整数，实际为 {value!r}。"
     return int(value)
-
 
 def _require_nonnegative_int(name: str, value: object) -> int:
-    if isinstance(value, bool) or not isinstance(value, (int, np.integer)) or int(value) < 0:
-        raise ValueError(f"{name} 必须是非负整数，实际为 {value!r}。")
+    assert not isinstance(value, bool) and isinstance(value, (int, np.integer)) and int(value) >= 0, f"{name} 必须是非负整数，实际为 {value!r}。"
     return int(value)
-
 
 def _round_bin(value: float) -> int:
     """距离 bin 的确定性四舍五入；距离轴通常非负，避免 Python 的银行家舍入。"""
@@ -58,15 +47,14 @@ def _round_bin(value: float) -> int:
 class Candidate:
     """一次实际 CNN batch 中 q 最大块换算后的候选。
 
-    ``latest_range_m`` 必须是文档第 2.1 节定义的最新帧位置 ``z_t``，而不是
-    模型原始输出的块内中心距离 ``rho_m``。如调用方只有原始输出，请使用
-    :meth:`from_block_prediction` 完成坐标转换。
+    ``latest_range_m`` 必须是文档第 2.1 节定义的最新帧位置 ``z_t``，而不是模型原始输出的块内中心距离 ``rho_m``。
+    使用 `from_block_prediction` 完成 CNN 原始输出坐标转换。
     """
 
-    q: float
-    latest_range_m: float
-    speed_m_per_frame: float
-    block_start_m: float | None = None
+    q: float                            # CNN 预测块内目标存在概率
+    latest_range_m: float               # CNN 预测块内最新帧距离
+    speed_m_per_frame: float            # CNN 预测块内目标平均速度
+    block_start_m: float | None = None  # 分块起始距离
 
     @classmethod
     def from_block_prediction(
@@ -78,10 +66,8 @@ class Candidate:
         block_start_m: float,
         frames_per_window: int = 20,
     ) -> "Candidate":
-        """从 SimpleCNN 的 ``(q, rho_m, nu_mpf)`` 创建统一时间坐标候选。
-
-        对 20 帧窗口，模型 ``rho_m`` 对应中心时刻 9.5 帧；因此最新帧位置为
-        ``block_start + rho_m + 9.5 * speed``。
+        """从 SimpleCNN 的 ``(q, rho_m, nu_mpf)`` 创建统一时间坐标候选
+        对 20 帧窗口，模型 ``rho_m`` 对应中心时刻 9.5 帧；因此最新帧位置为 ``z_t = block_start + rho_m + 9.5 * speed``
         """
         frames = _require_positive_int("frames_per_window", frames_per_window)
         center_offset = (frames - 1) / 2.0
@@ -95,46 +81,31 @@ class Candidate:
 
     @property
     def is_valid(self) -> bool:
-        """候选是否可安全进入聚类、门控和滤波。
-
-        q 是概率 head 输出；超出 [0, 1] 通常意味着调用方误传了 logit，因此也
-        视为无效，而不是让它绕过 ``q_keep``。
-        """
-        if not all(
-            _is_finite_number(value)
-            for value in (self.q, self.latest_range_m, self.speed_m_per_frame)
-        ):
+        """候选是否可安全进入聚类、门控和滤波"""
+        if not all(_is_finite_number(value) for value in (self.q, self.latest_range_m, self.speed_m_per_frame)):
+            return False
+        if not 0.0 <= float(self.q) <= 1.0:
             return False
         if self.block_start_m is not None and not _is_finite_number(self.block_start_m):
             return False
-        return 0.0 <= float(self.q) <= 1.0
-
-    def to_dict(self) -> dict[str, float | None]:
-        """返回可直接写入 JSONL 的安全表示，NaN/Inf 会转成 ``None``。"""
-        return {
-            "q": _as_finite_or_none(self.q),
-            "latest_range_m": _as_finite_or_none(self.latest_range_m),
-            "speed_m_per_frame": _as_finite_or_none(self.speed_m_per_frame),
-            "block_start_m": (
-                None if self.block_start_m is None else _as_finite_or_none(self.block_start_m)
-            ),
-        }
+        return True
 
 
 @dataclass(frozen=True)
 class TrackerConfig:
     """文档第 10 节所需的后处理参数。
 
-    ``position_gate_m`` 的第 ``L`` 项即 ``G_r(L)``。默认仅实现文档指定的
-    L=0/1/2 三个局部搜索等级，L=2 再失败会进入 ``RECAPTURE``。
+    ``instant_speed_gate_mpf`` 和 ``average_speed_gate_mpf`` 的第 ``L`` 项分别限制单帧融合状态速度与最近窗口平均速度，单位均为米/帧
+    默认仅实现L=0/1/2 三个局部搜索等级，L=2 再失败会进入 ``RECAPTURE``
     """
 
-    capture_stride: int = 3
     capture_buffer_size: int = 8
     capture_support_ratio: float = 0.7
     capture_radius_m: float = 500.0
     q_keep: float = 0.5
-    position_gate_m: tuple[float, ...] = (1_000.0, 2_000.0, 4_000.0)
+    instant_speed_gate_mpf: tuple[float, ...] = (17.0, 25.0, 34.0)
+    average_speed_gate_mpf: tuple[float, ...] = (17.0, 25.0, 34.0)
+    speed_average_window_frames: int = 20
     expand_after_bad: int = 2
     shrink_after_good: int = 4
     alpha: float = 0.8
@@ -148,7 +119,6 @@ class TrackerConfig:
     max_search_level: int = 2
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "capture_stride", _require_positive_int("capture_stride", self.capture_stride))
         object.__setattr__(
             self,
             "capture_buffer_size",
@@ -161,6 +131,11 @@ class TrackerConfig:
             _require_positive_int("shrink_after_good", self.shrink_after_good),
         )
         object.__setattr__(self, "frames_per_window", _require_positive_int("frames_per_window", self.frames_per_window))
+        object.__setattr__(
+            self,
+            "speed_average_window_frames",
+            _require_positive_int("speed_average_window_frames", self.speed_average_window_frames),
+        )
         object.__setattr__(self, "max_search_level", _require_nonnegative_int("max_search_level", self.max_search_level))
 
         finite_fields = {
@@ -176,41 +151,29 @@ class TrackerConfig:
             "range_max_m": self.range_max_m,
         }
         for name, value in finite_fields.items():
-            if not _is_finite_number(value):
-                raise ValueError(f"{name} 必须是有限数，实际为 {value!r}。")
+            assert _is_finite_number(value), f"{name} 必须是有限数，实际为 {value!r}。"
             object.__setattr__(self, name, float(value))
 
-        if not 0.0 < self.capture_support_ratio <= 1.0:
-            raise ValueError("capture_support_ratio 必须在 (0, 1] 内。")
-        if self.capture_radius_m < 0.0:
-            raise ValueError("capture_radius_m 不能为负数。")
-        if not 0.0 <= self.q_keep <= 1.0:
-            raise ValueError("q_keep 必须在 [0, 1] 内。")
-        if not 0.0 <= self.alpha <= 1.0:
-            raise ValueError("alpha 必须在 [0, 1] 内。")
-        if self.beta < 0.0:
-            raise ValueError("beta 不能为负数。")
-        if not 0.0 <= self.gamma <= 1.0:
-            raise ValueError("gamma 必须在 [0, 1] 内。")
-        if self.block_width_m <= 0.0 or self.block_step_m <= 0.0:
-            raise ValueError("block_width_m 和 block_step_m 必须为正数。")
-        if self.range_max_m <= self.range_min_m:
-            raise ValueError("range_max_m 必须大于 range_min_m。")
-        if self.range_max_m - self.range_min_m < self.block_width_m:
-            raise ValueError("测距范围必须至少容纳一个完整 block_width_m 块。")
+        assert 0.0 < self.capture_support_ratio <= 1.0, "capture_support_ratio 必须在 (0, 1] 内。"
+        assert self.capture_radius_m >= 0.0, "capture_radius_m 不能为负数。"
+        assert 0.0 <= self.q_keep <= 1.0, "q_keep 必须在 [0, 1] 内。"
+        assert 0.0 <= self.alpha <= 1.0, "alpha 必须在 [0, 1] 内。"
+        assert self.beta >= 0.0, "beta 不能为负数。"
+        assert 0.0 <= self.gamma <= 1.0, "gamma 必须在 [0, 1] 内。"
+        assert self.block_width_m > 0.0 and self.block_step_m > 0.0, "block_width_m 和 block_step_m 必须为正数。"
+        assert self.range_max_m > self.range_min_m, "range_max_m 必须大于 range_min_m。"
+        assert self.range_max_m - self.range_min_m >= self.block_width_m, "测距范围必须至少容纳一个完整 block_width_m 块。"
 
-        try:
-            gates = tuple(float(value) for value in self.position_gate_m)
-        except TypeError as exc:
-            raise ValueError("position_gate_m 必须是按搜索等级排列的数值序列。") from exc
-        if len(gates) != self.max_search_level + 1:
-            raise ValueError(
-                "position_gate_m 长度必须等于 max_search_level + 1，"
-                f"实际为 {len(gates)}。"
+        for name in ("instant_speed_gate_mpf", "average_speed_gate_mpf"):
+            try:
+                gates = tuple(float(value) for value in getattr(self, name))
+            except TypeError as exc:
+                raise AssertionError(f"{name} 必须是按搜索等级排列的数值序列。") from exc
+            assert len(gates) == self.max_search_level + 1, (
+                f"{name} 长度必须等于 max_search_level + 1，实际为 {len(gates)}。"
             )
-        if any(not math.isfinite(value) or value < 0.0 for value in gates):
-            raise ValueError("position_gate_m 中所有门限必须为非负有限数。")
-        object.__setattr__(self, "position_gate_m", gates)
+            assert all(math.isfinite(value) and value >= 0.0 for value in gates), f"{name} 中所有门限必须为非负有限数。"
+            object.__setattr__(self, name, gates)
 
     @property
     def center_frame_offset(self) -> float:
@@ -250,65 +213,27 @@ class TrackerConfig:
 
 @dataclass(frozen=True)
 class StepDiagnostics:
-    """每个实时步进的完整、可序列化诊断结果。"""
+    """单步状态机结果；仅包含状态转移和诊断真正需要的数据。"""
 
     frame_index: int
     mode: TrackerMode
     mode_before: TrackerMode
     range_current_m: float | None
-    range_next_m: float | None
     speed_m_per_frame: float | None
-    candidate: Candidate | None
     candidate_accepted: bool
     measurement_updated: bool
     search_level: int
     evaluated_search_level: int | None
-    good_count: int
-    bad_count: int
-    blocks_evaluated: int
-    block_starts_m: tuple[int, ...]
     position_residual_m: float | None
     speed_residual_m_per_frame: float | None
     capture_buffer_size: int
     capture_support_count: int
     capture_confirmed: bool
-    capture_scan_due: bool
+    rejected_by: tuple[str, ...]
+    extrapolation_range_m: float | None
+    extrapolation_speed_mpf: float | None
+    extrapolation_reference_frame: int | None
 
-    @property
-    def candidate_q(self) -> float | None:
-        return None if self.candidate is None else _as_finite_or_none(self.candidate.q)
-
-    @property
-    def candidate_range_m(self) -> float | None:
-        return None if self.candidate is None else _as_finite_or_none(self.candidate.latest_range_m)
-
-    def to_dict(self) -> dict[str, object]:
-        """转为 JSON-safe 字典，保留状态转换和门控诊断。"""
-        return {
-            "frame_index": self.frame_index,
-            "mode": self.mode.value,
-            "mode_before": self.mode_before.value,
-            "range_current_m": self.range_current_m,
-            "range_next_m": self.range_next_m,
-            "speed_m_per_frame": self.speed_m_per_frame,
-            "candidate": None if self.candidate is None else self.candidate.to_dict(),
-            "candidate_q": self.candidate_q,
-            "candidate_range_m": self.candidate_range_m,
-            "candidate_accepted": self.candidate_accepted,
-            "measurement_updated": self.measurement_updated,
-            "search_level": self.search_level,
-            "evaluated_search_level": self.evaluated_search_level,
-            "good_count": self.good_count,
-            "bad_count": self.bad_count,
-            "blocks_evaluated": self.blocks_evaluated,
-            "block_starts_m": list(self.block_starts_m),
-            "position_residual_m": self.position_residual_m,
-            "speed_residual_m_per_frame": self.speed_residual_m_per_frame,
-            "capture_buffer_size": self.capture_buffer_size,
-            "capture_support_count": self.capture_support_count,
-            "capture_confirmed": self.capture_confirmed,
-            "capture_scan_due": self.capture_scan_due,
-        }
 
 
 @dataclass(frozen=True)
@@ -318,24 +243,45 @@ class _TimedCandidate:
 
 
 @dataclass(frozen=True)
+class _StatePoint:
+    """用于按真实帧跨度计算平均状态速度的历史锚点。"""
+
+    frame_index: int
+    range_current_m: float
+
+
+@dataclass(frozen=True)
 class _CaptureEstimate:
     range_current_m: float
     speed_m_per_frame: float
     support_count: int
 
 
+@dataclass(frozen=True)
+class _StepOutcome:
+    """本步状态转移产物，供 :meth:`AdaptiveTracker._diagnostics` 统一封装。"""
+
+    candidate_accepted: bool = False
+    measurement_updated: bool = False
+    evaluated_search_level: int | None = None
+    position_residual_m: float | None = None
+    speed_residual_m_per_frame: float | None = None
+    capture_support_count: int = 0
+    capture_confirmed: bool = False
+    rejected_by: tuple[str, ...] = ()
+
+
 class AdaptiveTracker:
     """文档第 3～9 节的 CAPTURE / TRACK / RECAPTURE 状态机。
 
-    调用顺序：先用 :meth:`capture_scan_due` 或 :attr:`mode` 决定本步应做全局
-    还是局部 CNN 推理；调用方从本步 batch 取得 q-Top1 后，调用 :meth:`step`。
+    调用方根据 :attr:`mode` 决定本步应做全局还是局部 CNN 推理；从 batch
+    取得 q-Top1 后调用 :meth:`step`。
     该方法只接受已经换算到最新帧坐标的 :class:`Candidate`，不会接触模型。
     """
 
     def __init__(self, config: TrackerConfig | None = None) -> None:
         self.config = TrackerConfig() if config is None else config
-        if not isinstance(self.config, TrackerConfig):
-            raise TypeError("config 必须是 TrackerConfig。")
+        assert isinstance(self.config, TrackerConfig), "config 必须是 TrackerConfig。"
         self.reset()
 
     def reset(self, mode: TrackerMode | str = TrackerMode.CAPTURE) -> None:
@@ -346,7 +292,14 @@ class AdaptiveTracker:
         self._speed_m_per_frame: float | None = None
         self._last_state_frame: int | None = None
         self._last_step_frame: int | None = None
-        self._last_capture_scan_frame: int | None = None
+        # RECAPTURE 时状态机不会使用旧轨迹继续决策；下面三项只用于输出一条
+        # 明确标为不可靠的可视化外推线，直至新的 CAPTURE 被确认。
+        self._extrapolation_range_m: float | None = None
+        self._extrapolation_speed_mpf: float | None = None
+        self._extrapolation_reference_frame: int | None = None
+        self._state_history: deque[_StatePoint] = deque(
+            maxlen=self.config.speed_average_window_frames + 2
+        )
         self._search_level = 0
         self._good_count = 0
         self._bad_count = 0
@@ -368,25 +321,8 @@ class AdaptiveTracker:
         return self._search_level
 
     @property
-    def good_count(self) -> int:
-        return self._good_count
-
-    @property
-    def bad_count(self) -> int:
-        return self._bad_count
-
-    @property
     def capture_buffer_size(self) -> int:
         return len(self._capture_buffer)
-
-    def capture_scan_due(self, frame_index: int) -> bool:
-        """当前帧是否应执行一次全局扫描；TRACK 期间始终返回 ``False``。"""
-        frame = _require_nonnegative_int("frame_index", frame_index)
-        if self._mode not in {TrackerMode.CAPTURE, TrackerMode.RECAPTURE}:
-            return False
-        if self._last_capture_scan_frame is None:
-            return True
-        return frame - self._last_capture_scan_frame >= self.config.capture_stride
 
     def global_block_starts_m(self) -> tuple[int, ...]:
         """暴露标准全局网格，供 CAPTURE/RECAPTURE 调用方一次组成 batch。"""
@@ -395,16 +331,13 @@ class AdaptiveTracker:
     def predict_state(self, frame_index: int) -> tuple[float, float]:
         """从最新滤波状态匀速外推到 ``frame_index``，不修改内部状态。"""
         frame = _require_nonnegative_int("frame_index", frame_index)
-        if self._mode is not TrackerMode.TRACK or self._last_state_frame is None:
-            raise RuntimeError("当前不在 TRACK 状态，不能进行局部运动预测。")
-        if frame < self._last_state_frame:
-            raise ValueError("frame_index 不能早于当前轨迹状态帧。")
+        assert self._mode is TrackerMode.TRACK and self._last_state_frame is not None, "当前不在 TRACK 状态，不能进行局部运动预测。"
+        assert frame >= self._last_state_frame, "frame_index 不能早于当前轨迹状态帧。"
         assert self._range_current_m is not None
         assert self._speed_m_per_frame is not None
         dt = frame - self._last_state_frame
         predicted_range = self._range_current_m + dt * self._speed_m_per_frame
-        if not _is_finite_number(predicted_range):
-            raise RuntimeError("运动预测产生非有限距离；请重置或进入 RECAPTURE。")
+        assert _is_finite_number(predicted_range), "运动预测产生非有限距离；请重置或进入 RECAPTURE。"
         return float(predicted_range), float(self._speed_m_per_frame)
 
     def local_block_starts_m(self, frame_index: int) -> tuple[int, ...]:
@@ -422,61 +355,34 @@ class AdaptiveTracker:
                 starts.append(start)
         return tuple(starts)
 
-    def step(
-        self,
-        frame_index: int,
-        candidate: Candidate | None,
-        *,
-        blocks_evaluated: int | None = None,
-        block_starts_m: Sequence[int | float] = (),
-    ) -> StepDiagnostics:
-        """消费本步 q-Top1，并返回当前完整状态和门控诊断。
+    def step(self, frame_index: int, candidate: Candidate | None) -> StepDiagnostics:
+        """消费本步 q-Top1，并返回当前状态和门控诊断。
 
-        ``frame_index`` 必须严格递增。在 CAPTURE/RECAPTURE 中，调用方只应在
-        :meth:`capture_scan_due` 为真时传入全局 Top-1；在 TRACK 中每个推理步进
-        传入局部 q-Top1。候选为 ``None`` 或包含 NaN/Inf 时不会污染内部状态，
+        ``frame_index`` 必须严格递增。CAPTURE/RECAPTURE 传入全局 Top-1，
+        TRACK 传入局部 q-Top1。候选为 ``None`` 或包含 NaN/Inf 时不会污染内部状态，
         TRACK 中按一次失败处理。
         """
         frame = _require_nonnegative_int("frame_index", frame_index)
-        if self._last_step_frame is not None and frame <= self._last_step_frame:
-            raise ValueError(
-                f"frame_index 必须严格递增（上一帧为 {self._last_step_frame}，当前为 {frame}）。"
-            )
-        if candidate is not None and not isinstance(candidate, Candidate):
-            raise TypeError("candidate 必须是 Candidate 或 None。")
-        starts = self._normalise_block_starts(block_starts_m)
-        if blocks_evaluated is None:
-            evaluated_blocks = len(starts)
-        else:
-            evaluated_blocks = _require_nonnegative_int("blocks_evaluated", blocks_evaluated)
+        assert self._last_step_frame is None or frame > self._last_step_frame, (
+            f"frame_index 必须严格递增（上一帧为 {self._last_step_frame}，当前为 {frame}）。"
+        )
+        assert candidate is None or isinstance(candidate, Candidate), "candidate 必须是 Candidate 或 None。"
 
         mode_before = self._mode
-        capture_due = self.capture_scan_due(frame)
-        if self._mode in {TrackerMode.CAPTURE, TrackerMode.RECAPTURE}:
-            result = self._step_capture(frame, candidate)
-        else:
-            result = self._step_track(frame, candidate)
-
-        self._last_step_frame = frame
-        return self._diagnostics(
-            frame_index=frame,
-            mode_before=mode_before,
-            candidate=candidate,
-            blocks_evaluated=evaluated_blocks,
-            block_starts_m=starts,
-            capture_scan_due=capture_due,
-            **result,
+        outcome = (
+            self._step_capture(frame, candidate)
+            if self._mode in {TrackerMode.CAPTURE, TrackerMode.RECAPTURE}
+            else self._step_track(frame, candidate)
         )
+        self._last_step_frame = frame
+        return self._diagnostics(frame, mode_before, outcome)
 
-    def _step_capture(self, frame_index: int, candidate: Candidate | None) -> dict[str, object]:
+    def _step_capture(self, frame_index: int, candidate: Candidate | None) -> _StepOutcome:
         candidate_valid = candidate is not None and candidate.is_valid
         support_count = 0
         capture_confirmed = False
         measurement_updated = False
 
-        if candidate is not None:
-            # 无论数值是否有效，这都是一次实际全局扫描，下一次扫描按 stride 计时。
-            self._last_capture_scan_frame = frame_index
         if candidate_valid:
             assert candidate is not None
             self._capture_buffer.append(_TimedCandidate(frame_index, candidate))
@@ -491,69 +397,61 @@ class AdaptiveTracker:
                 capture_confirmed = True
                 measurement_updated = True
 
-        return {
-            "candidate_accepted": candidate_valid,
-            "measurement_updated": measurement_updated,
-            "evaluated_search_level": None,
-            "position_residual_m": None,
-            "speed_residual_m_per_frame": None,
-            "capture_support_count": support_count,
-            "capture_confirmed": capture_confirmed,
-        }
+        return _StepOutcome(
+            candidate_accepted=candidate_valid,
+            measurement_updated=measurement_updated,
+            capture_support_count=support_count,
+            capture_confirmed=capture_confirmed,
+        )
 
-    def _step_track(self, frame_index: int, candidate: Candidate | None) -> dict[str, object]:
+    def _step_track(self, frame_index: int, candidate: Candidate | None) -> _StepOutcome:
         if self._last_state_frame is None or self._range_current_m is None or self._speed_m_per_frame is None:
             # 防御性分支：不可能的半初始化状态不可继续输出旧轨迹。
-            self._enter_recapture()
-            return {
-                "candidate_accepted": False,
-                "measurement_updated": False,
-                "evaluated_search_level": None,
-                "position_residual_m": None,
-                "speed_residual_m_per_frame": None,
-                "capture_support_count": 0,
-                "capture_confirmed": False,
-            }
+            self._enter_recapture(preserve_extrapolation=False)
+            return _StepOutcome()
 
         dt = frame_index - self._last_state_frame
-        if dt <= 0:
-            raise ValueError(
-                f"TRACK 状态的 dt 必须大于 0（last={self._last_state_frame}，current={frame_index}）。"
-            )
+        assert dt > 0, f"TRACK 状态的 dt 必须大于 0（last={self._last_state_frame}，current={frame_index}）。"
         evaluated_level = self._search_level
         predicted_range = self._range_current_m + dt * self._speed_m_per_frame
         predicted_speed = self._speed_m_per_frame
         if not _is_finite_number(predicted_range) or not _is_finite_number(predicted_speed):
-            self._enter_recapture()
-            return {
-                "candidate_accepted": False,
-                "measurement_updated": False,
-                "evaluated_search_level": evaluated_level,
-                "position_residual_m": None,
-                "speed_residual_m_per_frame": None,
-                "capture_support_count": 0,
-                "capture_confirmed": False,
-            }
+            self._enter_recapture(preserve_extrapolation=False)
+            return _StepOutcome(evaluated_search_level=evaluated_level)
 
         position_residual: float | None = None
         speed_residual: float | None = None
         accepted = False
-        if candidate is not None and candidate.is_valid:
+        rejected_by: list[str] = []
+        if candidate is None:
+            rejected_by.append("missing_candidate")
+        elif not candidate.is_valid:
+            rejected_by.append("invalid_candidate")
+        else:
             position_residual = float(candidate.latest_range_m) - predicted_range
             speed_residual = float(candidate.speed_m_per_frame) - predicted_speed
-            if (
-                _is_finite_number(position_residual)
-                and _is_finite_number(speed_residual)
-                and float(candidate.q) >= self.config.q_keep
-                and abs(position_residual) <= self.config.position_gate_m[evaluated_level]
-            ):
+            if not _is_finite_number(position_residual) or not _is_finite_number(speed_residual):
+                rejected_by.append("nonfinite_residual")
+            elif float(candidate.q) < self.config.q_keep:
+                rejected_by.append("q_keep")
+            else:
                 updated_range = predicted_range + self.config.alpha * position_residual
                 position_speed = predicted_speed + self.config.beta * position_residual / dt
                 updated_speed = (
                     (1.0 - self.config.gamma) * position_speed
                     + self.config.gamma * float(candidate.speed_m_per_frame)
                 )
-                if _is_finite_number(updated_range) and _is_finite_number(updated_speed):
+                average_speed = self._recent_average_speed_mpf(frame_index, updated_range)
+                if not _is_finite_number(updated_range) or not _is_finite_number(updated_speed):
+                    rejected_by.append("nonfinite_update")
+                if abs(updated_speed) > self.config.instant_speed_gate_mpf[evaluated_level]:
+                    rejected_by.append("instant_speed")
+                if (
+                    average_speed is not None
+                    and abs(average_speed) > self.config.average_speed_gate_mpf[evaluated_level]
+                ):
+                    rejected_by.append("average_speed")
+                if not rejected_by:
                     self._range_current_m = float(updated_range)
                     self._speed_m_per_frame = float(updated_speed)
                     self._last_state_frame = frame_index
@@ -579,15 +477,18 @@ class AdaptiveTracker:
                 else:
                     self._enter_recapture()
 
-        return {
-            "candidate_accepted": accepted,
-            "measurement_updated": accepted,
-            "evaluated_search_level": evaluated_level,
-            "position_residual_m": position_residual,
-            "speed_residual_m_per_frame": speed_residual,
-            "capture_support_count": 0,
-            "capture_confirmed": False,
-        }
+        if self._mode is TrackerMode.TRACK:
+            assert self._range_current_m is not None
+            self._append_state_history(frame_index, self._range_current_m)
+
+        return _StepOutcome(
+            candidate_accepted=accepted,
+            measurement_updated=accepted,
+            evaluated_search_level=evaluated_level,
+            position_residual_m=position_residual,
+            speed_residual_m_per_frame=speed_residual,
+            rejected_by=tuple(rejected_by),
+        )
 
     def _capture_estimate(self, reference_frame: int) -> _CaptureEstimate | None:
         if not self._capture_buffer:
@@ -626,82 +527,106 @@ class AdaptiveTracker:
         self._bad_count = 0
         # 进入 TRACK 后旧捕获候选不再参与后续重捕获，避免混入失效轨迹。
         self._capture_buffer.clear()
-        self._last_capture_scan_frame = None
+        self._extrapolation_range_m = None
+        self._extrapolation_speed_mpf = None
+        self._extrapolation_reference_frame = None
+        self._state_history.clear()
+        self._append_state_history(frame_index, estimate.range_current_m)
 
-    def _enter_recapture(self) -> None:
-        """按文档第 8 节丢弃旧轨迹和旧缓存。"""
+    def _enter_recapture(self, *, preserve_extrapolation: bool = True) -> None:
+        """按文档第 8 节丢弃旧轨迹和旧缓存。
+
+        保留的外推状态只服务于离线输出，绝不参与重捕获候选选择或确认。
+        """
+        can_extrapolate = preserve_extrapolation and all(
+            value is not None and _is_finite_number(value)
+            for value in (self._range_current_m, self._speed_m_per_frame, self._last_state_frame)
+        )
+        if can_extrapolate:
+            self._extrapolation_range_m = float(self._range_current_m)
+            self._extrapolation_speed_mpf = float(self._speed_m_per_frame)
+            self._extrapolation_reference_frame = int(self._last_state_frame)
+        else:
+            self._extrapolation_range_m = None
+            self._extrapolation_speed_mpf = None
+            self._extrapolation_reference_frame = None
         self._mode = TrackerMode.RECAPTURE
         self._capture_buffer.clear()
         self._range_current_m = None
         self._speed_m_per_frame = None
         self._last_state_frame = None
-        self._last_capture_scan_frame = None
+        self._state_history.clear()
         self._search_level = 0
         self._good_count = 0
         self._bad_count = 0
 
+    def _append_state_history(self, frame_index: int, range_current_m: float) -> None:
+        self._state_history.append(_StatePoint(int(frame_index), float(range_current_m)))
+
+    def _recent_average_speed_mpf(
+        self,
+        frame_index: int,
+        proposed_range_m: float,
+    ) -> float | None:
+        """以至少 N 帧前的状态为锚点，计算候选更新后的平均速度。"""
+        cutoff = frame_index - self.config.speed_average_window_frames
+        anchor = next(
+            (point for point in reversed(self._state_history) if point.frame_index <= cutoff),
+            None,
+        )
+        if anchor is None:
+            return None
+        elapsed_frames = frame_index - anchor.frame_index
+        if elapsed_frames <= 0:
+            return None
+        average_speed = (float(proposed_range_m) - anchor.range_current_m) / elapsed_frames
+        return _as_finite_or_none(average_speed)
+
     def _diagnostics(
         self,
-        *,
         frame_index: int,
         mode_before: TrackerMode,
-        candidate: Candidate | None,
-        blocks_evaluated: int,
-        block_starts_m: tuple[int, ...],
-        capture_scan_due: bool,
-        candidate_accepted: object,
-        measurement_updated: object,
-        evaluated_search_level: object,
-        position_residual_m: object,
-        speed_residual_m_per_frame: object,
-        capture_support_count: object,
-        capture_confirmed: object,
+        outcome: _StepOutcome,
     ) -> StepDiagnostics:
         if self._mode is TrackerMode.TRACK:
             assert self._range_current_m is not None
             assert self._speed_m_per_frame is not None
             range_current = float(self._range_current_m)
             speed = float(self._speed_m_per_frame)
-            range_next = range_current + speed
-            if not _is_finite_number(range_next):  # pragma: no cover - 仅防御极端浮点溢出
+            if not _is_finite_number(range_current) or not _is_finite_number(speed):
                 range_current = None
-                range_next = None
                 speed = None
         else:
             range_current = None
-            range_next = None
             speed = None
+
+        extrapolation_range = None
+        extrapolation_speed = None
+        extrapolation_frame = None
+        if self._mode is TrackerMode.RECAPTURE:
+            extrapolation_range = self._extrapolation_range_m
+            extrapolation_speed = self._extrapolation_speed_mpf
+            extrapolation_frame = self._extrapolation_reference_frame
 
         return StepDiagnostics(
             frame_index=frame_index,
             mode=self._mode,
             mode_before=mode_before,
             range_current_m=range_current,
-            range_next_m=range_next,
             speed_m_per_frame=speed,
-            candidate=candidate,
-            candidate_accepted=bool(candidate_accepted),
-            measurement_updated=bool(measurement_updated),
+            candidate_accepted=outcome.candidate_accepted,
+            measurement_updated=outcome.measurement_updated,
             search_level=self._search_level,
-            evaluated_search_level=(
-                None if evaluated_search_level is None else int(evaluated_search_level)
-            ),
-            good_count=self._good_count,
-            bad_count=self._bad_count,
-            blocks_evaluated=blocks_evaluated,
-            block_starts_m=block_starts_m,
-            position_residual_m=(
-                None if position_residual_m is None else _as_finite_or_none(float(position_residual_m))
-            ),
-            speed_residual_m_per_frame=(
-                None
-                if speed_residual_m_per_frame is None
-                else _as_finite_or_none(float(speed_residual_m_per_frame))
-            ),
+            evaluated_search_level=outcome.evaluated_search_level,
+            position_residual_m=outcome.position_residual_m,
+            speed_residual_m_per_frame=outcome.speed_residual_m_per_frame,
             capture_buffer_size=len(self._capture_buffer),
-            capture_support_count=int(capture_support_count),
-            capture_confirmed=bool(capture_confirmed),
-            capture_scan_due=capture_scan_due,
+            capture_support_count=outcome.capture_support_count,
+            capture_confirmed=outcome.capture_confirmed,
+            rejected_by=outcome.rejected_by,
+            extrapolation_range_m=extrapolation_range,
+            extrapolation_speed_mpf=extrapolation_speed,
+            extrapolation_reference_frame=extrapolation_frame,
         )
 
     @staticmethod
@@ -709,24 +634,4 @@ class AdaptiveTracker:
         try:
             return TrackerMode(mode)
         except ValueError as exc:
-            raise ValueError(f"未知 TrackerMode: {mode!r}。") from exc
-
-    @staticmethod
-    def _normalise_block_starts(starts: Sequence[int | float]) -> tuple[int, ...]:
-        normalised: list[int] = []
-        for start in starts:
-            if not _is_finite_number(start):
-                raise ValueError(f"block_starts_m 包含非有限值: {start!r}。")
-            value = _round_bin(float(start))
-            if value not in normalised:
-                normalised.append(value)
-        return tuple(normalised)
-
-
-__all__ = [
-    "AdaptiveTracker",
-    "Candidate",
-    "StepDiagnostics",
-    "TrackerConfig",
-    "TrackerMode",
-]
+            raise AssertionError(f"未知 TrackerMode: {mode!r}。") from exc
