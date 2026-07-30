@@ -109,10 +109,7 @@ def _checkpoint_step(checkpoint: Mapping[str, Any]) -> int | str | None:
 def _select_records(bundle: InferenceBundle, args: argparse.Namespace) -> list[SourceRecord]:
     """稳定选取 data_root 按 source_id 排序后的前 N 个一级样本目录。"""
     records = sorted(discover_sources(bundle.config.data_root), key=lambda record: record.source_id)
-    assert args.num_samples <= len(records), (
-        f"num_samples={args.num_samples} 超过 data_root 中可用样本数 {len(records)}。"
-    )
-    return records[: args.num_samples]
+    return records[args.samples_start: args.samples_stop]
 
 
 def _sample_file_stem(method: str, time_stride: int) -> str:
@@ -514,8 +511,8 @@ def run(args: argparse.Namespace) -> Path:
         )
         logger.info(
             "[%d/%d] source=%s coverage=%.1f%% mae=%s m blocks=%d p95=%.2f ms",
-            selected_offset + 1,
-            len(selected_records),
+            selected_offset + 1 + int(args.samples_start),
+            len(selected_records) + int(args.samples_start),
             record.source_id,
             100.0 * float(trajectory["coverage"]),
             "—" if not math.isfinite(_optional_number(trajectory["mae_m"])) else f"{float(trajectory['mae_m']):.2f}",
@@ -550,11 +547,23 @@ def build_parser() -> argparse.ArgumentParser:
         default=Path("/mnt/host-model/weixc/code/LineTracker/data/synthetic/gen/F300_N10000_S42_B-random_T-R10000-290000m-V340-A6-C10-J1-K300-Q0p35-0p95"),
         help="当前机器上的一级样本目录根路径。",
     )
+    # parser.add_argument(
+    #     "--num-samples",
+    #     type=_positive_int,
+    #     default=10,
+    #     help="按 source_id 排序后取 data_root 前 N 个样本。",
+    # )
     parser.add_argument(
-        "--num-samples",
-        type=_positive_int,
-        default=10,
-        help="按 source_id 排序后取 data_root 前 N 个样本。",
+        "--sample-start", 
+        type=_nonnegative_int, 
+        default=None, 
+        help="评估样本索引范围起点。"
+    )
+    parser.add_argument(
+        "--sample-stop", 
+        type=_nonnegative_int, 
+        default=None, 
+        help="评估样本索引范围终点。"
     )
     parser.add_argument(
         "--device",
@@ -684,7 +693,8 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     args.method = 'adaptive_tracker'
     args.time_stride = 5
-    args.num_samples = 5000
+    args.samples_start = 1800
+    args.samples_stop = 5000
 
     try:
         run(args)
