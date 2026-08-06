@@ -693,8 +693,8 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     args.method = 'adaptive_tracker'
     args.time_stride = 5
-    args.samples_start = 1800
-    args.samples_stop = 5000
+    args.samples_start = 1
+    args.samples_stop = 2
 
     try:
         run(args)
