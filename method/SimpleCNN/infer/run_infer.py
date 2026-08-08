@@ -88,7 +88,7 @@ def _csv_values(raw: str, converter: Callable[[str], Any], name: str) -> tuple[A
         raise AssertionError(f"{name} 应为逗号分隔的合法值：{raw!r}。") from error
 
 
-def _optional_number(value: object) -> float:
+def _optional_number(value) -> float:
     try:
         numeric = float(value)
     except (TypeError, ValueError):
@@ -473,6 +473,7 @@ def run(args: argparse.Namespace) -> Path:
 
         # 完成样本推理。两种方法共享模型、数据和输出协议，仅在流式候选选择/状态机实现上分叉。
         if args.method == "global_top1":
+            assert isinstance(method_config, GlobalTop1Config) and tracker_config is not None
             result = run_global_source(source, runner, bundle.config, method_config)
         else:
             assert isinstance(method_config, AdaptiveInferenceConfig) and tracker_config is not None

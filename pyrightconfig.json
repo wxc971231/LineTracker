@@ -1,0 +1,13 @@
+{
+    "exclude": [
+        "**/data",
+        "**/runs",
+        "**/wandb",
+        "**/__pycache__",
+        "**/checkpoints",
+        "**/outputs", "**/node_modules", "**/.*"
+    ],
+    "extraPaths": [
+        "method/SimpleCNN"
+    ]
+}

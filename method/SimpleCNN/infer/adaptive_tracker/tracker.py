@@ -20,7 +20,7 @@ class TrackerMode(str, Enum):
     TRACK = "TRACK"
     RECAPTURE = "RECAPTURE"
 
-def _is_finite_number(value: object) -> bool:
+def _is_finite_number(value) -> bool:
     """仅接受可转换为有限 float 的标量，防止 NaN/Inf 污染状态。"""
     try:
         return math.isfinite(float(value))
@@ -344,8 +344,14 @@ class AdaptiveTracker:
         """按文档第 5.2 节生成当前搜索等级的去重局部块起点。"""
         if self._mode is not TrackerMode.TRACK:
             return ()
+
+        # 将捕获/上一次 TRACK 状态从其所在时间窗最新帧匀速外推到当前待推理时间窗的最新帧
         predicted_range, predicted_speed = self.predict_state(frame_index)
+
+        # 回退 center_frame_offset 帧，得到当前时间窗中心时刻的预测距离
         center_range = predicted_range - self.config.center_frame_offset * predicted_speed
+
+        # 将以 center_range 为中心截取距离块，取得距离起点
         center_start = self.config.clamp_block_start(center_range - self.config.block_width_m / 2.0)
 
         starts: list[int] = []
@@ -543,6 +549,9 @@ class AdaptiveTracker:
             for value in (self._range_current_m, self._speed_m_per_frame, self._last_state_frame)
         )
         if can_extrapolate:
+            assert self._last_state_frame is not None
+            assert self._range_current_m is not None
+            assert self._speed_m_per_frame is not None
             self._extrapolation_range_m = float(self._range_current_m)
             self._extrapolation_speed_mpf = float(self._speed_m_per_frame)
             self._extrapolation_reference_frame = int(self._last_state_frame)
