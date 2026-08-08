@@ -81,6 +81,35 @@ _TIMING_EXPLANATIONS = {
     "end_to_end_p95_ms": "样本各逻辑步端到端耗时的 95% 分位（ms）",
 }
 
+_COMMON_PARAMETER_ROWS = (
+    ("method_dir", "方法配置目录", "输出根目录下与本次方法对应的参数快照名称"),
+    ("method", "推理方法", "候选搜索与后处理方法"),
+    ("time_stride", "TRACK 时间步进（帧）", "每次输入窗向未来外推的帧数，也是 TRACK 阶段滑窗步进"),
+    ("checkpoint_global_step", "Checkpoint step", "该 checkpoint 对应的优化器更新步数"),
+    # ("requested_device", "请求设备", "命令行指定的设备选择"),
+    ("effective_device", "实际设备", "运行时解析后实际执行模型前向的设备"),
+    ("max_blocks_per_forward", "单次前向最大块数", "0 表示同一逻辑步的全部候选块一次前向；正数时会拆分 batch"),
+    ("jump_threshold_m", "跳变阈值（m）", "离线统计 jump_count 时的相邻帧距离跳变阈值"),
+    ("warmup", "预热", "是否在正式样本计时前执行模型预热"),
+    # ("figure_dpi", "诊断图 DPI", "单样本诊断图保存分辨率"),
+    # ("save_figures", "保存诊断图", "是否为每个样本生成 visualize.png"),
+)
+_ADAPTIVE_PARAMETER_ROWS = (
+    ("capture_stride", "CAPTURE/RECAPTURE 步进（帧）", "相邻全局扫描窗口的时间步进"),
+    ("capture_buffer_size", "捕获缓存长度", "用于稳定捕获判断的连续全局候选数量"),
+    ("capture_support_ratio", "捕获支持比例", "确认捕获所需的一致候选比例"),
+    ("capture_radius_m", "捕获聚类半径（m）", "判定全局候选在同一距离区域的半径"),
+    ("q_keep", "候选 q 门限", "保留候选并判定跟踪成功所需的最低预测 q"),
+    ("instant_speed_gate_mpf", "瞬时速度门限（m/frame）", "L0/L1/L2 三个搜索等级的融合状态绝对速度上限"),
+    ("average_speed_gate_mpf", "平均速度门限（m/frame）", "L0/L1/L2 三个搜索等级的历史平均速度上限"),
+    ("speed_average_window_frames", "平均速度历史长度（帧）", "计算平均速度门控时使用的历史状态窗口"),
+    ("expand_after_bad", "扩大搜索阈值", "连续失败达到该次数后，局部搜索等级扩大一级"),
+    ("shrink_after_good", "收缩搜索阈值", "连续成功达到该次数后，局部搜索等级缩小一级"),
+    ("alpha", "α", "α-β 预测器的位置更新系数"),
+    ("beta", "β", "α-β 预测器的速度更新系数"),
+    ("gamma", "γ", "候选速度与 α-β 状态速度的融合权重"),
+)
+
 
 def _nonnegative_int(value: str) -> int:
     """解析命令行中的非负样本编号"""
@@ -175,6 +204,20 @@ def _read_json(path: Path) -> Mapping[str, Any]:
             return _mapping(json.load(handle), context=str(path))
     except json.JSONDecodeError as error:
         raise ValueError(f"无法解析 JSON：{path}") from error
+
+
+def _load_method_parameter_snapshot(run_dir: Path, method_dir: str) -> tuple[Path, Mapping[str, Any] | None]:
+    """读取 run_infer 写入的同名方法参数快照；旧结果缺失时保留明确空值。"""
+    path = run_dir / f"{method_dir}.json"
+    if not path.is_file():
+        return path, None
+    payload = _read_json(path)
+    expected_method, expected_stride = _parse_method_directory(method_dir)
+    if payload.get("method_dir") != method_dir:
+        raise ValueError(f"{path} 的 method_dir 与文件名不一致")
+    if payload.get("method") != expected_method or payload.get("time_stride") != expected_stride:
+        raise ValueError(f"{path} 的 method/time_stride 与文件名不一致")
+    return path, payload
 
 
 def _normalise_metrics(
@@ -365,6 +408,7 @@ def build_summary(
     }
     infer_config_path = run_dir / "_infer_config.json"
     infer_config = _read_json(infer_config_path) if infer_config_path.is_file() else None
+    parameter_snapshot_path, parameter_snapshot = _load_method_parameter_snapshot(run_dir, method_dir)
     summary: dict[str, Any] = {
         "schema_version": 1,
         "generated_at_utc": datetime.now(timezone.utc).isoformat(),
@@ -381,6 +425,8 @@ def build_summary(
             "missing_metrics_source_indices": missing_indices,
             "metrics_schema_version": SCHEMA_VERSION,
             "infer_config": infer_config,
+            "parameter_snapshot_path": str(parameter_snapshot_path.resolve()),
+            "parameter_snapshot": parameter_snapshot,
         },
         "trajectory": trajectory,
         "compute": compute,
@@ -427,6 +473,89 @@ def _format_number(value: object, digits: int = 4) -> str:
     return f"{float(cast(Any, value)):.{digits}g}"
 
 
+def _format_parameter_value(value: object) -> str:
+    """将 JSON 参数值渲染为紧凑、可读且适合 Markdown 表格的文本。"""
+    if value is None:
+        return "null"
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, Mapping):
+        return ", ".join(f"{key}={_format_parameter_value(item)}" for key, item in value.items())
+    if isinstance(value, (list, tuple)):
+        return ", ".join(_format_parameter_value(item) for item in value)
+    if isinstance(value, float):
+        return _format_number(value)
+    return str(value)
+
+
+def _project_relative_path(value: object) -> str:
+    """将路径缩短为相对 LineTracker 项目根目录的形式，便于跨机器阅读报告。"""
+    path = Path(str(value))
+    try:
+        root_index = path.parts.index("LineTracker")
+    except ValueError:
+        # 非本项目路径没有可靠的公共锚点，保留调用方提供的形式以免误导。
+        return str(path)
+    relative_parts = path.parts[root_index + 1:]
+    return str(Path(*relative_parts)) if relative_parts else "."
+
+
+def _format_requested_sample_range(value: object) -> str:
+    """按 summary_v5 的 --sample-start/--sample-stop 配置展示编号范围。"""
+    requested = _mapping(value, context="summary.input.requested_source_index_range")
+    start = requested.get("start")
+    stop = requested.get("stop")
+    if start is None and stop is None:
+        return "全部样本（未设置范围限制）"
+    if start is None:
+        return f"编号不大于 {stop}"
+    if stop is None:
+        return f"编号不小于 {start}"
+    return f"{start}–{stop}（含两端）"
+
+
+def _parameter_table(input_info: Mapping[str, Any]) -> list[str]:
+    """从同名方法参数快照生成报告开头的推理超参数表。"""
+    snapshot_path = _project_relative_path(input_info["parameter_snapshot_path"])
+    snapshot_value = input_info.get("parameter_snapshot")
+    if snapshot_value is None:
+        return [
+            "## 推理超参数",
+            "",
+            f"> 未找到参数快照：`{snapshot_path}`。该历史结果未记录 run_infer.py 的实际参数，无法可靠补写。",
+        ]
+    snapshot = _mapping(snapshot_value, context="summary.input.parameter_snapshot")
+    common = _mapping(snapshot.get("common"), context="parameter_snapshot.common")
+    adaptive = snapshot.get("adaptive_tracker")
+    rows: list[tuple[str, object, str]] = []
+    for key, label, description in _COMMON_PARAMETER_ROWS:
+        if key in common:
+            value = common[key]
+        else:
+            value = snapshot.get(key)
+        rows.append((label, value, description))
+    if adaptive is not None:
+        adaptive_mapping = _mapping(adaptive, context="parameter_snapshot.adaptive_tracker")
+        for key, label, description in _ADAPTIVE_PARAMETER_ROWS:
+            rows.append((label, adaptive_mapping.get(key), description))
+
+    lines = [
+        "## 推理超参数",
+        "",
+        f"参数快照：`{snapshot_path}`",
+        "",
+        f"Checkpoint：`{_project_relative_path(snapshot.get('checkpoint_path'))}`",
+        "",
+        f"数据根目录：`{_project_relative_path(snapshot.get('data_root'))}`",
+        "",
+        "| 参数 | 取值 | 含义 |",
+        "|---|---|---|",
+    ]
+    for label, value, description in rows:
+        lines.append(f"| {label} | {_format_parameter_value(value)} | {description} |")
+    return lines
+
+
 def _metric_table(
     title: str,
     metrics: Mapping[str, Mapping[str, Any]],
@@ -466,14 +595,16 @@ def _build_report(summary: Mapping[str, Any], samples: Sequence[Mapping[str, Any
         f"# {input_info['method_dir']} 性能汇总",
         "",
         f"- 生成时间（UTC）：{summary['generated_at_utc']}",
-        f"- Run 目录：`{input_info['run_dir']}`",
-        f"- 纳入样本：{input_info['sample_count']} 个，编号 {input_info['source_index_range']['start']}–{input_info['source_index_range']['stop']}",
+        f"- 样本编号范围（summary_v5 配置）：{_format_requested_sample_range(input_info['requested_source_index_range'])}",
+        f"- 实际纳入样本：{input_info['sample_count']} 个",
         f"- 方法：`{input_info['method']}`；时间步进：{input_info['time_stride']} 帧",
         f"- metrics schema：v{input_info['metrics_schema_version']}",
     ]
     missing = input_info["missing_metrics_source_indices"]
     if missing:
         lines.extend([f"- 缺少选定方法 metrics 的样本编号：{', '.join(map(str, missing))}"])
+    lines.extend([""])
+    lines.extend(_parameter_table(input_info))
     lines.extend([""])
     lines.extend(
         _metric_table(

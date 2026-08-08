@@ -109,11 +109,24 @@ def _checkpoint_step(checkpoint: Mapping[str, Any]) -> int | str | None:
 def _select_records(bundle: InferenceBundle, args: argparse.Namespace) -> list[SourceRecord]:
     """稳定选取 data_root 按 source_id 排序后的前 N 个一级样本目录。"""
     records = sorted(discover_sources(bundle.config.data_root), key=lambda record: record.source_id)
-    return records[args.samples_start: args.samples_stop]
+    sample_start, sample_stop = _effective_sample_bounds(args)
+    return records[sample_start:sample_stop]
 
 
 def _sample_file_stem(method: str, time_stride: int) -> str:
     return f"{safe_name(method)}_stride{time_stride}"
+
+
+def _effective_sample_bounds(args: argparse.Namespace) -> tuple[int, int | None]:
+    """兼容现有启动入口，返回本次实际用于切片的样本编号范围。"""
+    sample_start = getattr(args, "sample_start", None)
+    sample_stop = getattr(args, "sample_stop", None)
+    # 旧启动入口仍会写入复数形式字段；仅在 CLI 参数未设置时才使用它们。
+    if sample_start is None:
+        sample_start = getattr(args, "samples_start", 0)
+    if sample_stop is None:
+        sample_stop = getattr(args, "samples_stop", None)
+    return int(sample_start), None if sample_stop is None else int(sample_stop)
 
 
 def _figure_title(method: str, source_id: str, time_stride: int) -> str:
@@ -147,6 +160,60 @@ def _method_config(args: argparse.Namespace) -> GlobalTop1Config | AdaptiveInfer
         )
     else:
         raise ValueError(f"不支持的推理方法：{args.method!r}。")
+
+
+def _write_method_parameter_snapshot(
+    output_dir: Path,
+    *,
+    args: argparse.Namespace,
+    bundle: InferenceBundle,
+    checkpoint_step: int | str | None,
+    method_config: GlobalTop1Config | AdaptiveInferenceConfig,
+    complexity: ModelComplexity,
+) -> Path:
+    """按方法目录名保存本次实际推理参数，供离线汇总报告复现使用。"""
+    method_dir = _sample_file_stem(args.method, args.time_stride)
+    payload: dict[str, Any] = {
+        "schema_version": 1,
+        "method_dir": method_dir,
+        "method": args.method,
+        "time_stride": args.time_stride,
+        "checkpoint_path": bundle.checkpoint_path,
+        "checkpoint_global_step": checkpoint_step,
+        "resolved_config_path": bundle.resolved_config_path,
+        "data_root": bundle.config.data_root,
+        "requested_device": args.device,
+        "effective_device": str(bundle.device),
+        "common": {
+            "max_blocks_per_forward": args.max_blocks_per_forward,
+            "jump_threshold_m": args.jump_threshold_m,
+            "warmup": args.warmup,
+            "figure_dpi": args.figure_dpi,
+            "save_figures": args.save_figures,
+        },
+        "model_complexity_per_block": _static_model_complexity(complexity),
+    }
+    if isinstance(method_config, AdaptiveInferenceConfig):
+        payload["adaptive_tracker"] = {
+            "capture_stride": method_config.capture_stride,
+            "capture_buffer_size": method_config.capture_buffer_size,
+            "capture_support_ratio": method_config.capture_support_ratio,
+            "capture_radius_m": method_config.capture_radius_m,
+            "q_keep": method_config.q_keep,
+            "instant_speed_gate_mpf": method_config.instant_speed_gate_mpf,
+            "average_speed_gate_mpf": method_config.average_speed_gate_mpf,
+            "speed_average_window_frames": method_config.speed_average_window_frames,
+            "expand_after_bad": method_config.expand_after_bad,
+            "shrink_after_good": method_config.shrink_after_good,
+            "alpha": method_config.alpha,
+            "beta": method_config.beta,
+            "gamma": method_config.gamma,
+        }
+    else:
+        payload["global_top1"] = {"time_stride": method_config.time_stride}
+    destination = output_dir / f"{method_dir}.json"
+    write_json(destination, payload)
+    return destination
 
 def _trajectory_summary(
     result: Mapping[str, Any],
@@ -448,6 +515,14 @@ def run(args: argparse.Namespace) -> Path:
                 "model_complexity_per_block": _static_model_complexity(complexity),
             },
         )
+    parameter_path = _write_method_parameter_snapshot(
+        output_dir,
+        args=args,
+        bundle=bundle,
+        checkpoint_step=checkpoint_step,
+        method_config=method_config,
+        complexity=complexity,
+    )
 
     # 加载评估数据和推理执行器
     selected_records = _select_records(bundle, args)
@@ -466,7 +541,8 @@ def run(args: argparse.Namespace) -> Path:
 
     # 启动逐样本评估
     logger = configure_logger(f"{args.method}-{bundle.checkpoint_path.stem}")
-    logger.info("开始 %s：device=%s", _METHOD_TITLES[args.method], bundle.device)
+    logger.info("开始 %s：device=%s，参数快照=%s", _METHOD_TITLES[args.method], bundle.device, parameter_path)
+    sample_start, _ = _effective_sample_bounds(args)
     for selected_offset, record in enumerate(selected_records):
         # 仅复用预热时的第一个 PackedSource；其余样本按需加载，控制峰值内存
         source = first_source if selected_offset == 0 and first_source is not None else PackedSource(record, bundle.config)
@@ -512,8 +588,8 @@ def run(args: argparse.Namespace) -> Path:
         )
         logger.info(
             "[%d/%d] source=%s coverage=%.1f%% mae=%s m blocks=%d p95=%.2f ms",
-            selected_offset + 1 + int(args.samples_start),
-            len(selected_records) + int(args.samples_start),
+            selected_offset + 1 + sample_start,
+            len(selected_records) + sample_start,
             record.source_id,
             100.0 * float(trajectory["coverage"]),
             "—" if not math.isfinite(_optional_number(trajectory["mae_m"])) else f"{float(trajectory['mae_m']):.2f}",
