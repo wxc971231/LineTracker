@@ -11,7 +11,7 @@ import sys
 import types
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Mapping, cast
 
 import torch
 
@@ -29,6 +29,7 @@ from runtime.settings import (
 )
 from train.model import SimpleCNN
 from utils.checkpoint import load_checkpoint
+from utils.torch_compat import import_torch_npu, torch_npu_backend
 
 
 @dataclass(frozen=True)
@@ -56,9 +57,9 @@ def install_torch_npu_checkpoint_shim() -> bool:
     """
 
     try:
-        import torch_npu  # noqa: F401 - 原生 Ascend 环境不应替换真实模块。
+        torch_npu = import_torch_npu()  # 原生 Ascend 环境不应替换真实模块。
     except ModuleNotFoundError:
-        torch_npu = None  # type: ignore[assignment]
+        pass
     else:
         return bool(getattr(torch_npu, "__linetracker_checkpoint_shim__", False))
 
@@ -74,6 +75,12 @@ def install_torch_npu_checkpoint_shim() -> bool:
         def __init__(self, value: int) -> None:
             self.value = value
 
+    rebuild_tensor_v2 = getattr(
+        getattr(torch, "_utils", None), "_rebuild_tensor_v2", None
+    )
+    if not callable(rebuild_tensor_v2):
+        raise RuntimeError("当前 PyTorch 缺少 checkpoint 兼容层所需的 _rebuild_tensor_v2。")
+
     def rebuild_npu_tensor(
         storage: Any,
         offset: int,
@@ -86,17 +93,16 @@ def install_torch_npu_checkpoint_shim() -> bool:
         """以普通 PyTorch storage 重建张量，格式标记由 CPU/CUDA 忽略。"""
 
         del npu_format
-        return torch._utils._rebuild_tensor_v2(
-            storage, offset, size, stride, requires_grad, hooks
-        )
+        return cast(torch.Tensor, rebuild_tensor_v2(storage, offset, size, stride, requires_grad, hooks))
 
-    format_module.Format = Format
-    storage_module._rebuild_npu_tensor = rebuild_npu_tensor
-    torch_npu_module.utils = utils_module
-    torch_npu_module.npu = npu_module
-    torch_npu_module.__linetracker_checkpoint_shim__ = True
-    utils_module.storage = storage_module
-    npu_module._format = format_module
+    # 这些属性仅为反序列化构造运行时模块；使用 setattr 明确其动态性质。
+    setattr(format_module, "Format", Format)
+    setattr(storage_module, "_rebuild_npu_tensor", rebuild_npu_tensor)
+    setattr(torch_npu_module, "utils", utils_module)
+    setattr(torch_npu_module, "npu", npu_module)
+    setattr(torch_npu_module, "__linetracker_checkpoint_shim__", True)
+    setattr(utils_module, "storage", storage_module)
+    setattr(npu_module, "_format", format_module)
     sys.modules.update(
         {
             "torch_npu": torch_npu_module,
@@ -148,10 +154,11 @@ def _npu_is_available() -> bool:
     """延迟导入 Ascend 依赖，避免 CUDA/CPU 环境强制安装 torch_npu。"""
 
     try:
-        import torch_npu  # noqa: F401 - 导入会向 torch 注册 npu 后端。
+        import_torch_npu()  # 导入会向 torch 注册 npu 后端。
     except ImportError:
         return False
-    return hasattr(torch, "npu") and bool(torch.npu.is_available())
+    npu_backend = torch_npu_backend()
+    return npu_backend is not None and bool(npu_backend.is_available())
 
 
 def _set_cuda_device(request: str) -> torch.device:
@@ -173,17 +180,20 @@ def _set_npu_device(request: str) -> torch.device:
             f"请求设备 {request!r}，但当前环境未检测到可用 Ascend NPU。"
             "请确认 torch、torch_npu 与 CANN 版本匹配。"
         )
-    import torch_npu  # noqa: F401 - 已由上面的可用性检查注册 torch.npu。
+    import_torch_npu()  # 已由上面的可用性检查注册 torch.npu。
 
     device = torch.device(request)
-    device_count = int(torch.npu.device_count())
+    npu_backend = torch_npu_backend()
+    if npu_backend is None:  # pragma: no cover - 已由 _npu_is_available 保证。
+        raise RuntimeError("torch_npu 已导入，但 torch.npu 未注册。")
+    device_count = int(npu_backend.device_count())
     if device.index is not None and not 0 <= device.index < device_count:
         raise ValueError(
             f"请求的 NPU 设备索引 {device.index} 越界；当前可见设备数为 {device_count}。"
         )
-    if hasattr(torch.npu, "config"):
-        torch.npu.config.allow_internal_format = True
-    torch.npu.set_device(device)
+    if hasattr(npu_backend, "config"):
+        npu_backend.config.allow_internal_format = True
+    npu_backend.set_device(device)
     return device
 
 

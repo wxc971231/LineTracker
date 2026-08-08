@@ -5,7 +5,7 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal, cast
 
 from configs.base import SimpleCNNConfig
 from utils.distributed import DistributedContext
@@ -66,7 +66,7 @@ class WandbLogger:
             name=build_wandb_run_name(config, run_dir),
             dir=str(wandb_dir),
             config=config.as_serializable_dict(),
-            mode=config.wandb_mode,
+            mode=cast(Literal["online", "offline", "disabled", "shared"], config.wandb_mode),
             settings=wandb_settings,
             id=resume_id,
             resume="allow" if resume_id else None,

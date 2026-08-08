@@ -7,6 +7,7 @@ import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
+from typing import Any
 
 import numpy as np
 
@@ -65,8 +66,8 @@ class InferEntryTests(unittest.TestCase):
             data_root = Path(temporary)
             for source_id in ("dataset1_synthetic_0010", "dataset1_synthetic_0002", "dataset1_synthetic_0000"):
                 (data_root / source_id).mkdir()
-            bundle = SimpleNamespace(config=SimpleNamespace(data_root=data_root))
-            args = SimpleNamespace(num_samples=2)
+            bundle: Any = SimpleNamespace(config=SimpleNamespace(data_root=data_root))  # 最小推理 bundle 替身。
+            args: Any = SimpleNamespace(samples_start=0, samples_stop=2)  # 仅覆盖该函数读取的参数。
             records = _select_records(bundle, args)
         self.assertEqual([record.source_id for record in records], ["dataset1_synthetic_0000", "dataset1_synthetic_0002"])
 
@@ -170,7 +171,7 @@ class InferEntryTests(unittest.TestCase):
         )
 
     def test_trajectory_summary_marks_unreliable_coverage(self) -> None:
-        source = SimpleNamespace(
+        source: Any = SimpleNamespace(  # 指标函数只读取潜在轨迹与目标命中掩码。
             target_true_range_m=np.asarray([0.0, 1.0, 2.0]),
             target_hit=np.asarray([True, True, True]),
         )
@@ -221,4 +222,3 @@ class InferEntryTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-

@@ -11,7 +11,7 @@ import math
 from pathlib import Path
 import re
 import tempfile
-from typing import Any
+from typing import Any, cast
 
 import numpy as np
 
@@ -49,7 +49,8 @@ def _finite(value: object) -> float | None:
     if value is None:
         return None
     try:
-        number = float(value)
+        # ``object`` 已在运行时传给 float 校验；cast 仅补足静态类型信息。
+        number = float(cast(Any, value))
     except (TypeError, ValueError):
         return None
     return number if math.isfinite(number) else None

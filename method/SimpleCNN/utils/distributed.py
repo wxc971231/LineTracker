@@ -5,12 +5,13 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass
 from datetime import timedelta
-from typing import TypeVar
+from typing import Any, TypeVar
 
 import torch
 import torch.distributed as dist
 
 from runtime.settings import RuntimeSettings
+from utils.torch_compat import import_torch_npu, torch_npu_backend
 
 
 T = TypeVar("T")
@@ -38,10 +39,11 @@ class DistributedContext:
 def _npu_is_available() -> bool:
     """延迟导入 torch_npu，避免 NVIDIA/CPU 环境要求安装 Ascend 依赖。"""
     try:
-        import torch_npu  # noqa: F401 - 导入会向 torch 注册 npu 后端。
+        import_torch_npu()  # 导入会向 torch 注册 npu 后端。
     except ImportError:
         return False
-    return hasattr(torch, "npu") and torch.npu.is_available()
+    npu_backend = torch_npu_backend()
+    return npu_backend is not None and bool(npu_backend.is_available())
 
 
 def _resolve_device(requested: str, local_rank: int) -> tuple[torch.device, str]:
@@ -51,11 +53,14 @@ def _resolve_device(requested: str, local_rank: int) -> tuple[torch.device, str]
         torch.cuda.set_device(device)
         return device, "nccl"
     if requested in {"auto", "npu"} and _npu_is_available():
-        import torch_npu  # noqa: F401 - 已由此导入注册 torch.npu.config。
+        import_torch_npu()  # 已由此导入注册 torch.npu.config。
 
-        torch.npu.config.allow_internal_format = True
+        npu_backend = torch_npu_backend()
+        if npu_backend is None:  # pragma: no cover - 已由 _npu_is_available 保证。
+            raise RuntimeError("torch_npu 已导入，但 torch.npu 未注册。")
+        npu_backend.config.allow_internal_format = True
         device = torch.device("npu", local_rank)
-        torch.npu.set_device(device)
+        npu_backend.set_device(device)
         return device, "hccl"
     if requested == "cpu" or requested == "auto":
         return torch.device("cpu"), "gloo"
@@ -77,7 +82,7 @@ def setup_distributed(settings: RuntimeSettings) -> DistributedContext:
     backend = default_backend if settings.distributed_backend == "auto" else settings.distributed_backend
 
     if world_size > 1 and not dist.is_initialized():
-        init_kwargs: dict[str, object] = {
+        init_kwargs: dict[str, Any] = {
             "backend": backend,
             "timeout": timedelta(minutes=settings.distributed_timeout_minutes),
         }
@@ -137,7 +142,7 @@ def broadcast_module_buffers(module: torch.nn.Module, context: DistributedContex
         dist.broadcast(buffer, src=0)
 
 
-def rank_zero_print(context: DistributedContext, *args: object, **kwargs: object) -> None:
+def rank_zero_print(context: DistributedContext, *args: object, **kwargs: Any) -> None:
     """只由 rank 0 输出控制台信息。"""
     if context.is_main:
         print(*args, **kwargs)

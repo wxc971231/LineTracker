@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ctypes
+import importlib
 import os
 import re
 
@@ -63,7 +64,7 @@ def build_process_title(
 def _apply_process_title(title: str) -> None:
     """优先设置完整 argv 标题；依赖缺失时至少设置 Linux comm 短名称。"""
     try:
-        from setproctitle import setproctitle
+        setproctitle = getattr(importlib.import_module("setproctitle"), "setproctitle")
     except ImportError:
         try:
             # PR_SET_NAME 只保留 15 bytes，但足以让 ps 的 comm 显示 SimpleCNN 前缀。

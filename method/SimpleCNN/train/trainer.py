@@ -6,20 +6,38 @@ import math
 import time
 from contextlib import nullcontext
 from pathlib import Path
-from typing import Any, Iterator
+from collections.abc import Iterable
+from typing import Any, Iterator, Protocol, cast
 
 import torch
 from torch import nn
 from torch.nn.parallel import DistributedDataParallel
 
 from configs.base import SimpleCNNConfig
-from eval.evaluator import evaluate_model, move_batch_to_device
+from eval.evaluator import BatchIterable, evaluate_model, move_batch_to_device
 from eval.metrics import empty_metric_totals, metric_accumulator_dtype, metrics_from_totals
 from train.losses import LossOutput, compute_losses
 from train.model import SimpleCNN
 from utils.checkpoint import atomic_torch_save, rotate_checkpoints
 from utils.distributed import DistributedContext, broadcast_module_buffers, rank_zero_print, reduce_sum
-from utils.logging import WandbLogger
+from utils.torch_compat import import_torch_npu, torch_npu_backend
+
+
+Batch = dict[str, torch.Tensor]
+
+
+class TrainingLogger(Protocol):
+    """训练器实际依赖的日志接口。"""
+
+    @property
+    def run_id(self) -> str | None:
+        ...
+
+    def log(self, values: dict[str, float | int], step: int) -> None:
+        ...
+
+    def finish(self) -> None:
+        ...
 
 
 def _configure_distributed_batch_norm(
@@ -28,7 +46,7 @@ def _configure_distributed_batch_norm(
 ) -> SimpleCNN:
     """在 CUDA/NPU 多卡训练中使用全局同步的 BatchNorm 统计量。"""
     if context.is_distributed and context.device.type in {"cuda", "npu"}:
-        return nn.SyncBatchNorm.convert_sync_batchnorm(model)
+        return cast(SimpleCNN, nn.SyncBatchNorm.convert_sync_batchnorm(model))
     return model
 
 
@@ -40,9 +58,9 @@ class Trainer:
         config: SimpleCNNConfig,
         context: DistributedContext,
         run_dir: Path,
-        train_loader: Iterator[dict[str, torch.Tensor]],
-        validation_loader: Iterator[dict[str, torch.Tensor]],
-        logger: WandbLogger,
+        train_loader: Iterable[Batch],
+        validation_loader: BatchIterable,
+        logger: TrainingLogger,
         resume_payload: dict[str, Any] | None = None,
         data_stream_generation: int = 0,
         validation_dataset_id: str = "unknown",
@@ -64,11 +82,12 @@ class Trainer:
         self.requires_resume_validation_baseline = False
         self.train_iterator = iter(train_loader)
 
-        self.raw_model = _configure_distributed_batch_norm(
+        self.raw_model: SimpleCNN = _configure_distributed_batch_norm(
             SimpleCNN(config),
             context,
         ).to(context.device)
         self.ddp_model: DistributedDataParallel | None = None
+        self.model: nn.Module
         if context.is_distributed:
             ddp_kwargs: dict[str, Any] = {
                 # SyncBatchNorm 在 CUDA/NPU 多卡前向中聚合 batch 统计量；
@@ -84,11 +103,12 @@ class Trainer:
                     }
                 )
             self.ddp_model = DistributedDataParallel(self.raw_model, **ddp_kwargs)
-            self.model: nn.Module = self.ddp_model
+            self.model = self.ddp_model
         else:
             self.model = self.raw_model
         if config.compile_model:
-            self.model = torch.compile(self.model)
+            # torch.compile 的类型存根同时覆盖函数编译重载；此处输入明确为 nn.Module。
+            self.model = cast(nn.Module, torch.compile(self.model))
 
         self.optimizer = torch.optim.AdamW(
             self.raw_model.parameters(),
@@ -128,8 +148,9 @@ class Trainer:
         if device_type == "cuda" and torch.cuda.is_bf16_supported():
             return torch.bfloat16, False
         if device_type == "npu":
+            npu_backend = torch_npu_backend()
             try:
-                if torch.npu.is_bf16_supported():
+                if npu_backend is not None and npu_backend.is_bf16_supported():
                     return torch.bfloat16, False
             except (AttributeError, RuntimeError):
                 pass
@@ -139,11 +160,11 @@ class Trainer:
     def _create_scaler(self, enabled: bool):
         """兼容不同 PyTorch 版本的 GradScaler 构造接口。"""
         try:
-            return torch.amp.GradScaler(self.context.device.type, enabled=enabled)
+            grad_scaler = getattr(torch.amp, "GradScaler")
+            return grad_scaler(self.context.device.type, enabled=enabled)
         except (AttributeError, TypeError):  # pragma: no cover - 兼容旧版 PyTorch
             if self.context.device.type == "npu":
-                import torch_npu
-
+                torch_npu = import_torch_npu()
                 return torch_npu.npu.amp.GradScaler(enabled=enabled)
             return torch.cuda.amp.GradScaler(enabled=enabled)
 
@@ -340,11 +361,10 @@ class Trainer:
         """跨卡合并一个日志周期的训练统计，并由 rank 0 写入 W&B。"""
         totals = reduce_sum(totals, self.context)
         metrics = metrics_from_totals(totals, self.config, "train")
-        grad_norm_value = (
-            float(grad_norm.detach().item())
-            if isinstance(grad_norm, torch.Tensor)
-            else float(grad_norm)
-        )
+        if isinstance(grad_norm, (int, float)):
+            grad_norm_value = float(grad_norm)
+        else:
+            grad_norm_value = float(grad_norm.detach().item())
         global_samples = (
             self.config.batch_size_per_gpu
             * self.context.world_size

@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import math
 from collections.abc import Mapping, Sequence
-from typing import Any
+from typing import Any, Literal, cast
 
 import numpy as np
 
@@ -44,6 +44,9 @@ def _unpack_local_range(
     bitorder: str,
 ) -> np.ndarray:
     """仅解包绘图所需的局部距离区间，避免展开完整 300 km 二值矩阵。"""
+    if bitorder not in {"big", "little"}:
+        raise ValueError(f"不支持的位序：{bitorder!r}。")
+    validated_bitorder = cast(Literal["big", "little"], bitorder)
     array = np.asarray(packed, dtype=np.uint8)
     assert array.ndim == 2, f"packed 观测应为二维数组，实际形状为 {array.shape}。"
     assert 0 <= range_start < range_stop <= array.shape[1] * 8, "局部距离范围超出 packed 观测可表示的范围。"
@@ -52,7 +55,7 @@ def _unpack_local_range(
     width = range_stop - range_start
     byte_count = math.ceil((bit_offset + width) / 8)
     unpacked = np.unpackbits(
-        array[:, first_byte : first_byte + byte_count], axis=1, bitorder=bitorder
+        array[:, first_byte : first_byte + byte_count], axis=1, bitorder=validated_bitorder
     )
     return unpacked[:, bit_offset : bit_offset + width].astype(bool, copy=False)
 

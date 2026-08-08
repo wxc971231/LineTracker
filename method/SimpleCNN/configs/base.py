@@ -8,7 +8,7 @@ import json
 import math
 from dataclasses import asdict, dataclass, fields
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any, Literal, Sequence
 
 
 METHOD_ROOT = Path(__file__).resolve().parents[1]
@@ -44,7 +44,7 @@ class SimpleCNNConfig:
     range_bins: int = 300_000                       # 每帧总距离 bin 数；当前每个 bin 对应 1 m。
     block_width_m: int = 10_000                     # 单个局部块的距离宽度（m/bin）；SimpleCNN-v1 固定为 10 km。
     spatial_step_m: int = 9_000                     # 推理/验证标准分块的距离步进（m），相邻块重叠 1 km。
-    packed_bitorder: str = "big"                    # observation_packed 的 bit 解包顺序，必须与合成器 packbits 一致。
+    packed_bitorder: Literal["big", "little"] = "big"  # observation_packed 的 bit 解包顺序，必须与合成器 packbits 一致。
 
     # 训练数据流
     num_workers: int = 0                            # 每个 rank 的 DataLoader 子进程数；0 表示在主训练进程中在线裁剪。

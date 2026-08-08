@@ -5,6 +5,7 @@ from __future__ import annotations
 import sys
 import unittest
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 
@@ -82,7 +83,7 @@ class InferMethodTests(unittest.TestCase):
     def test_global_top1_uses_all_standard_blocks_and_forecasts_future_stride(self) -> None:
         source = _FakeSource(frames=27)
         runner = _FakeRunner()
-        result = run_global_source(
+        result: Any = run_global_source(
             source,  # type: ignore[arg-type]
             runner,  # type: ignore[arg-type]
             self.config,
@@ -126,7 +127,7 @@ class InferMethodTests(unittest.TestCase):
             expand_after_bad=1,
             shrink_after_good=1,
         )
-        result = run_adaptive_source(
+        result: Any = run_adaptive_source(
             source,  # type: ignore[arg-type]
             runner,  # type: ignore[arg-type]
             self.config,
@@ -160,7 +161,7 @@ class InferMethodTests(unittest.TestCase):
             expand_after_bad=2,
             shrink_after_good=4,
         )
-        result = run_adaptive_source(
+        result: Any = run_adaptive_source(
             source,  # type: ignore[arg-type]
             runner,  # type: ignore[arg-type]
             self.config,
@@ -186,4 +187,3 @@ class InferMethodTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-

@@ -324,7 +324,7 @@ def rearrange_distance_channels(window: np.ndarray, config: SimpleCNNConfig) -> 
 
 
 def _trajectory_relation(
-    source: PackedSource,
+    source: PackedSource | LabelSource,
     time_start: int,
     range_start: int,
     config: SimpleCNNConfig,
@@ -340,7 +340,7 @@ def _trajectory_relation(
 
 
 def build_target_labels(
-    source: PackedSource,
+    source: PackedSource | LabelSource,
     time_start: int,
     range_start: int,
     config: SimpleCNNConfig,

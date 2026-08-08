@@ -5,6 +5,7 @@ from __future__ import annotations
 import sys
 import unittest
 from pathlib import Path
+from typing import Any
 from unittest import mock
 
 import torch
@@ -45,6 +46,8 @@ class LossTests(unittest.TestCase):
         self.assertEqual(losses.line_loss.item(), 0.0)
         self.assertIsNotNone(rho.grad)
         self.assertIsNotNone(nu.grad)
+        assert rho.grad is not None
+        assert nu.grad is not None
         self.assertTrue(torch.equal(rho.grad, torch.zeros_like(rho)))
         self.assertTrue(torch.equal(nu.grad, torch.zeros_like(nu)))
 
@@ -79,6 +82,7 @@ class LossTests(unittest.TestCase):
                 losses.total.backward()
                 for tensor in (q_logit, rho, nu):
                     self.assertIsNotNone(tensor.grad)
+                    assert tensor.grad is not None
                     self.assertTrue(torch.isfinite(tensor.grad).all().item())
 
     def test_q_loss_ignores_zero_evidence_sample(self) -> None:
@@ -100,6 +104,7 @@ class LossTests(unittest.TestCase):
 
         self.assertEqual(losses.q_count.item(), 1.0)
         self.assertAlmostEqual(losses.q_loss.item(), 0.693147, places=5)
+        assert q_logit.grad is not None
         self.assertEqual(q_logit.grad[0].item(), 0.0)
 
     def test_line_huber_is_divided_by_fixed_scale(self) -> None:
@@ -153,6 +158,25 @@ class _ScaleDroppingScaler:
         return self.scale_value
 
 
+class _PassThroughScaler:
+    """模拟不缩放、但会正常调用 optimizer.step 的 GradScaler。"""
+
+    def scale(self, loss: torch.Tensor) -> torch.Tensor:
+        return loss
+
+    def unscale_(self, optimizer) -> None:
+        return None
+
+    def step(self, optimizer) -> None:
+        optimizer.step()
+
+    def update(self) -> None:
+        return None
+
+    def get_scale(self) -> float:
+        return 1.0
+
+
 class _TinyModel(torch.nn.Module):
     def __init__(self) -> None:
         super().__init__()
@@ -172,7 +196,7 @@ class TrainerMetricTests(unittest.TestCase):
     """验证日志区间吞吐量使用真实 optimizer step 数。"""
 
     def test_steps_per_second_uses_interval_step_count(self) -> None:
-        trainer = Trainer.__new__(Trainer)
+        trainer: Any = Trainer.__new__(Trainer)  # 测试仅构造当前方法依赖的最小 Trainer 状态。
         trainer.config = SimpleCNNConfig()
         trainer.context = DistributedContext(0, 0, 1, torch.device("cpu"), "gloo")
         trainer.logger = _CaptureLogger()
@@ -191,7 +215,7 @@ class TrainerMetricTests(unittest.TestCase):
 
 
     def test_skipped_grad_scaler_update_does_not_advance_global_step(self) -> None:
-        trainer = Trainer.__new__(Trainer)
+        trainer: Any = Trainer.__new__(Trainer)
         trainer.config = SimpleCNNConfig(batch_size_per_gpu=2)
         trainer.context = DistributedContext(0, 0, 1, torch.device("cpu"), "gloo")
         trainer.raw_model = _TinyModel()
@@ -219,14 +243,14 @@ class TrainerMetricTests(unittest.TestCase):
         self.assertEqual(trainer.global_step, 7)
 
     def test_successful_optimizer_update_advances_global_step(self) -> None:
-        trainer = Trainer.__new__(Trainer)
+        trainer: Any = Trainer.__new__(Trainer)
         trainer.config = SimpleCNNConfig(batch_size_per_gpu=2)
         trainer.context = DistributedContext(0, 0, 1, torch.device("cpu"), "gloo")
         trainer.raw_model = _TinyModel()
         trainer.model = trainer.raw_model
         trainer.ddp_model = None
         trainer.optimizer = torch.optim.AdamW(trainer.raw_model.parameters(), lr=1e-3)
-        trainer.scaler = torch.amp.GradScaler("cpu", enabled=False)
+        trainer.scaler = _PassThroughScaler()
         trainer.amp_dtype = None
         trainer.global_step = 7
         batch = {
@@ -246,7 +270,7 @@ class TrainerMetricTests(unittest.TestCase):
         self.assertEqual(trainer.global_step, 8)
 
     def test_resume_baseline_runs_before_any_new_optimizer_step(self) -> None:
-        trainer = Trainer.__new__(Trainer)
+        trainer: Any = Trainer.__new__(Trainer)
         trainer.config = SimpleCNNConfig(total_optimizer_steps=5)
         trainer.context = DistributedContext(0, 0, 1, torch.device("cpu"), "gloo")
         trainer.global_step = 5
@@ -260,7 +284,7 @@ class TrainerMetricTests(unittest.TestCase):
         self.assertFalse(trainer.requires_resume_validation_baseline)
 
     def test_validation_metric_selects_best_checkpoint(self) -> None:
-        trainer = Trainer.__new__(Trainer)
+        trainer: Any = Trainer.__new__(Trainer)
         trainer.config = SimpleCNNConfig()
         trainer.context = DistributedContext(0, 0, 1, torch.device("cpu"), "gloo")
         trainer.raw_model = torch.nn.Identity()
@@ -281,7 +305,7 @@ class DistributedBufferTests(unittest.TestCase):
     """验证 checkpoint 内容和分布式模型 buffer 同步。"""
 
     def test_restore_reapplies_resolved_optimizer_hyperparameters(self) -> None:
-        trainer = Trainer.__new__(Trainer)
+        trainer: Any = Trainer.__new__(Trainer)
         trainer.config = SimpleCNNConfig(
             learning_rate=2e-3,
             adam_beta1=0.8,
@@ -323,7 +347,7 @@ class DistributedBufferTests(unittest.TestCase):
         self.assertEqual(group["lr"], trainer._learning_rate_for_step(10))
 
     def test_validation_dataset_id_changes_best_protocol(self) -> None:
-        trainer = Trainer.__new__(Trainer)
+        trainer: Any = Trainer.__new__(Trainer)
         trainer.config = SimpleCNNConfig()
         trainer.context = DistributedContext(0, 0, 1, torch.device("cpu"), "gloo")
         trainer.validation_dataset_id = "cache-a"
@@ -336,7 +360,7 @@ class DistributedBufferTests(unittest.TestCase):
         self.assertIn("cache-b", second)
 
     def test_changed_validation_dataset_requires_resume_baseline(self) -> None:
-        trainer = Trainer.__new__(Trainer)
+        trainer: Any = Trainer.__new__(Trainer)
         trainer.config = SimpleCNNConfig()
         trainer.context = DistributedContext(0, 0, 1, torch.device("cpu"), "gloo")
         trainer.raw_model = torch.nn.Linear(1, 1)
@@ -362,7 +386,7 @@ class DistributedBufferTests(unittest.TestCase):
         self.assertEqual(trainer.best_validation_loss, float("inf"))
 
     def test_checkpoint_snapshot_records_stream_and_metric_protocol(self) -> None:
-        trainer = Trainer.__new__(Trainer)
+        trainer: Any = Trainer.__new__(Trainer)
         trainer.raw_model = torch.nn.Linear(1, 1)
         trainer.optimizer = torch.optim.SGD(trainer.raw_model.parameters(), lr=0.1)
         trainer.scaler = mock.Mock()

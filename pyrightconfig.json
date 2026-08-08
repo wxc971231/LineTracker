@@ -1,6 +1,8 @@
 {
+    "venv": "linetracker-py311",
+    "pythonVersion": "3.11",
     "exclude": [
-        "**/data",
+        "data",
         "**/runs",
         "**/wandb",
         "**/__pycache__",

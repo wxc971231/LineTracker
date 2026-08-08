@@ -51,7 +51,14 @@ def estimate_model_complexity(
             )
             kernel_h, kernel_w = module.kernel_size
             stride_h, stride_w = module.stride
-            padding_h, padding_w = module.padding
+            # ``Conv2d.padding`` 的类型也允许字符串（例如 "same"），而本模型
+            # 的静态 MAC 推导只支持可解析为整数的显式零填充。
+            if isinstance(module.padding, str):
+                raise ValueError(f"不支持字符串卷积 padding：{module.padding!r}。")
+            if isinstance(module.padding, int):
+                padding_h = padding_w = module.padding
+            else:
+                padding_h, padding_w = module.padding
             dilation_h, dilation_w = module.dilation
             height = _conv_output_size(height, kernel_h, stride_h, padding_h, dilation_h)
             width = _conv_output_size(width, kernel_w, stride_w, padding_w, dilation_w)

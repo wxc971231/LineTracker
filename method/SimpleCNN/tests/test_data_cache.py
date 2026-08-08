@@ -6,6 +6,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from typing import Any
 from unittest import mock
 from types import SimpleNamespace
 
@@ -77,7 +78,7 @@ class TargetLabelTests(unittest.TestCase):
     def test_binary_q_and_supervision_mask_follow_track_relation(self) -> None:
         config = SimpleCNNConfig()
         trajectory = np.linspace(9_950.0, 10_050.0, config.frames_per_window, dtype=np.float32)
-        source = SimpleNamespace(
+        source: Any = SimpleNamespace(  # 该测试替身仅提供 build_target_labels 所需的三组标签。
             target_true_range_m=trajectory,
             target_hit=np.ones(config.frames_per_window, dtype=np.bool_),
             target_hit_bin=np.rint(trajectory).astype(np.int32),
@@ -99,7 +100,7 @@ class TargetLabelTests(unittest.TestCase):
         self.assertEqual(float(background["q"]), 0.0)
         self.assertTrue(background["q_valid"])
 
-        zero_source = SimpleNamespace(
+        zero_source: Any = SimpleNamespace(  # 同上：不需要构造完整 PackedSource。
             target_true_range_m=trajectory,
             target_hit=np.zeros(config.frames_per_window, dtype=np.bool_),
             target_hit_bin=np.rint(trajectory).astype(np.int32),

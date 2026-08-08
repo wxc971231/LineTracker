@@ -30,6 +30,7 @@ from utils.checkpoint import load_checkpoint
 from utils.distributed import broadcast_object, cleanup_distributed, rank_zero_print, setup_distributed
 from utils.process_title import set_process_title
 from utils.seed import seed_everything
+from utils.torch_compat import import_torch_npu
 
 
 def install_torch_npu_checkpoint_shim() -> bool:
@@ -40,7 +41,7 @@ def install_torch_npu_checkpoint_shim() -> bool:
     视为普通 PyTorch storage；随后 ``map_location`` 会把它放到当前 CPU/CUDA 设备。
     """
     try:
-        import torch_npu  # noqa: F401 - 原生 NPU 环境直接使用真实实现。
+        import_torch_npu()  # 原生 NPU 环境直接使用真实实现。
         return False
     except ModuleNotFoundError:
         pass
@@ -57,17 +58,24 @@ def install_torch_npu_checkpoint_shim() -> bool:
         def __init__(self, value: int) -> None:
             self.value = value
 
+    rebuild_tensor_v2 = getattr(
+        getattr(torch, "_utils", None), "_rebuild_tensor_v2", None
+    )
+    if not callable(rebuild_tensor_v2):
+        raise RuntimeError("当前 PyTorch 缺少 checkpoint 兼容层所需的 _rebuild_tensor_v2。")
+
     def rebuild_npu_tensor(storage, offset, size, stride, requires_grad, hooks, npu_format):
         """忽略 Ascend 专属 storage 格式，以标准张量方式恢复权重。"""
         del npu_format
-        return torch._utils._rebuild_tensor_v2(storage, offset, size, stride, requires_grad, hooks)
+        return rebuild_tensor_v2(storage, offset, size, stride, requires_grad, hooks)
 
-    format_module.Format = Format
-    storage_module._rebuild_npu_tensor = rebuild_npu_tensor
-    torch_npu_module.utils = utils_module
-    torch_npu_module.npu = npu_module
-    utils_module.storage = storage_module
-    npu_module._format = format_module
+    # 这些属性仅为反序列化构造运行时模块；使用 setattr 明确其动态性质。
+    setattr(format_module, "Format", Format)
+    setattr(storage_module, "_rebuild_npu_tensor", rebuild_npu_tensor)
+    setattr(torch_npu_module, "utils", utils_module)
+    setattr(torch_npu_module, "npu", npu_module)
+    setattr(utils_module, "storage", storage_module)
+    setattr(npu_module, "_format", format_module)
     sys.modules.update({
         "torch_npu": torch_npu_module,
         "torch_npu.utils": utils_module,

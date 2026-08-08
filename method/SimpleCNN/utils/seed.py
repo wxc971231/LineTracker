@@ -7,6 +7,8 @@ import random
 import numpy as np
 import torch
 
+from utils.torch_compat import torch_npu_backend
+
 
 def seed_everything(seed: int, rank: int = 0) -> int:
     """设置当前 rank 的随机种子，并返回实际使用的种子。"""
@@ -16,8 +18,9 @@ def seed_everything(seed: int, rank: int = 0) -> int:
     torch.manual_seed(effective_seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(effective_seed)
-    if hasattr(torch, "npu") and torch.npu.is_available():
-        torch.npu.manual_seed_all(effective_seed)
+    npu_backend = torch_npu_backend()
+    if npu_backend is not None and npu_backend.is_available():
+        npu_backend.manual_seed_all(effective_seed)
     return effective_seed
 
 

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from contextlib import nullcontext
-from typing import Iterator
+from typing import Iterator, Protocol
 
 import torch
 from tqdm.auto import tqdm
@@ -13,6 +13,16 @@ from configs.base import SimpleCNNConfig
 from eval.metrics import empty_metric_totals, metric_accumulator_dtype, metrics_from_totals
 from train.losses import compute_losses
 from utils.distributed import DistributedContext, reduce_sum
+
+
+class BatchIterable(Protocol):
+    """可重复遍历且提供批次数的评估数据流接口。"""
+
+    def __iter__(self) -> Iterator[dict[str, torch.Tensor]]:
+        ...
+
+    def __len__(self) -> int:
+        ...
 
 
 def move_batch_to_device(batch: dict[str, torch.Tensor], device: torch.device) -> dict[str, torch.Tensor]:
@@ -31,8 +41,13 @@ def autocast_context(config: SimpleCNNConfig, device: torch.device):
     elif device.type == "cuda" and torch.cuda.is_bf16_supported():
         dtype = torch.bfloat16
     elif device.type == "npu":
+        npu_backend = getattr(torch, "npu", None)
         try:
-            dtype = torch.bfloat16 if torch.npu.is_bf16_supported() else torch.float16
+            dtype = (
+                torch.bfloat16
+                if npu_backend is not None and npu_backend.is_bf16_supported()
+                else torch.float16
+            )
         except (AttributeError, RuntimeError):
             dtype = torch.float16
     else:
@@ -43,7 +58,7 @@ def autocast_context(config: SimpleCNNConfig, device: torch.device):
 @torch.inference_mode()
 def evaluate_model(
     model: nn.Module,
-    dataloader: Iterator[dict[str, torch.Tensor]],
+    dataloader: BatchIterable,
     config: SimpleCNNConfig,
     context: DistributedContext,
     *,

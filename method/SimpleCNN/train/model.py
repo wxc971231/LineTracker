@@ -81,7 +81,7 @@ class SimpleCNN(nn.Module):
         self.nu_head = nn.Linear(self.hidden_dim, 1)
 
     def forward(self, x: torch.Tensor) -> dict[str, torch.Tensor]:
-        """输出 q logit、q 概率、中心距离和斜率。
+        r"""输出 q logit、q 概率、中心距离和斜率。
 
         ``rho_m`` 以块内 m/bins 数值表示；当前 $1\,\mathrm{m/bin}$ 下，
         它可直接与逐帧距离 bin 标签比较。

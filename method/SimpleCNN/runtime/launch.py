@@ -8,6 +8,7 @@ from pathlib import Path
 
 from runtime.settings import load_runtime_settings
 from utils.process_title import ensure_process_job_id, set_process_title
+from utils.torch_compat import import_torch_npu, torch_npu_backend
 
 
 def _visible_accelerator_count(requested: str) -> int:
@@ -18,13 +19,14 @@ def _visible_accelerator_count(requested: str) -> int:
         return torch.cuda.device_count()
     if requested in {"auto", "npu"}:
         try:
-            import torch_npu  # noqa: F401 - 注册 torch.npu 后端。
+            import_torch_npu()  # 注册 torch.npu 后端。
         except ImportError:
             if requested == "npu":
                 raise RuntimeError("LT_ACCELERATOR=npu，但未安装 torch_npu。") from None
         else:
-            if hasattr(torch, "npu") and torch.npu.is_available():
-                return torch.npu.device_count()
+            npu_backend = torch_npu_backend()
+            if npu_backend is not None and npu_backend.is_available():
+                return int(npu_backend.device_count())
     if requested == "cuda":
         raise RuntimeError("LT_ACCELERATOR=cuda，但未检测到可用 CUDA 设备。")
     if requested == "npu":
