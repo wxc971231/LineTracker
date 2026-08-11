@@ -291,8 +291,8 @@ def load_samples(
     *,
     sample_start: int | None,
     sample_stop: int | None,
-) -> tuple[list[dict[str, Any]], list[int], Path]:
-    """读取指定范围内已有的 schema v5 样本，同时返回缺失 metrics 的编号"""
+) -> tuple[list[dict[str, Any]], list[int], list[dict[str, Any]], Path]:
+    """读取指定范围内的样本；单样本校验失败时记录原因并继续处理其余样本。"""
     if sample_start is not None and sample_stop is not None and sample_start > sample_stop:
         raise ValueError("--sample-start 不得大于 --sample-stop")
     expected_method, expected_stride = _parse_method_directory(method_dir)
@@ -301,10 +301,22 @@ def load_samples(
         raise FileNotFoundError(f"未找到 samples 根目录：{sample_root}")
 
     source_dirs: list[tuple[int, Path]] = []
+    invalid_samples: list[dict[str, Any]] = []
     for path in sample_root.iterdir():
         if not path.is_dir() or path.name.startswith("_"):
             continue
-        index = _source_index(path.name)
+        try:
+            index = _source_index(path.name)
+        except ValueError as error:
+            invalid_samples.append(
+                {
+                    "source_index": None,
+                    "source_id": path.name,
+                    "metrics_path": None,
+                    "reason": str(error),
+                }
+            )
+            continue
         if (sample_start is None or index >= sample_start) and (sample_stop is None or index <= sample_stop):
             source_dirs.append((index, path))
     source_dirs.sort(key=lambda item: item[0])
@@ -320,17 +332,27 @@ def load_samples(
         if not metrics_path.is_file():
             missing_indices.append(index)
             continue
-        samples.append(
-            _normalise_metrics(
+        try:
+            sample = _normalise_metrics(
                 metrics_path,
                 source_id=source_dir.name,
                 expected_method=expected_method,
                 expected_stride=expected_stride,
             )
-        )
+        except (OSError, ValueError, TypeError, KeyError) as error:
+            invalid_samples.append(
+                {
+                    "source_index": index,
+                    "source_id": source_dir.name,
+                    "metrics_path": str(metrics_path.resolve()),
+                    "reason": str(error),
+                }
+            )
+            continue
+        samples.append(sample)
     if not samples:
-        raise FileNotFoundError(f"指定范围内没有 {method_dir!r} 的 metrics.json")
-    return samples, missing_indices, sample_root
+        raise FileNotFoundError(f"指定范围内没有通过校验的 {method_dir!r} metrics.json")
+    return samples, missing_indices, invalid_samples, sample_root
 
 
 def _step_timing_summary(samples: Iterable[Mapping[str, Any]]) -> dict[str, dict[str, float | int | None]]:
@@ -351,9 +373,9 @@ def build_summary(
     *,
     sample_start: int | None,
     sample_stop: int | None,
-) -> tuple[dict[str, Any], list[dict[str, Any]], list[int]]:
+) -> tuple[dict[str, Any], list[dict[str, Any]], list[int], list[dict[str, Any]]]:
     """按轨迹、计算量、耗时和状态机四类指标构建机器可读汇总"""
-    samples, missing_indices, sample_root = load_samples(
+    samples, missing_indices, invalid_samples, sample_root = load_samples(
         run_dir,
         method_dir,
         sample_start=sample_start,
@@ -423,6 +445,7 @@ def build_summary(
             "source_index_range": {"start": min(indices), "stop": max(indices)},
             "included_source_indices": indices,
             "missing_metrics_source_indices": missing_indices,
+            "invalid_metrics_samples": invalid_samples,
             "metrics_schema_version": SCHEMA_VERSION,
             "infer_config": infer_config,
             "parameter_snapshot_path": str(parameter_snapshot_path.resolve()),
@@ -433,7 +456,7 @@ def build_summary(
         "timing": timing,
         "tracker": tracker,
     }
-    return summary, samples, missing_indices
+    return summary, samples, missing_indices, invalid_samples
 
 
 def _atomic_json(path: Path, payload: Mapping[str, Any]) -> None:
@@ -459,6 +482,19 @@ def _atomic_csv(path: Path, rows: Sequence[Mapping[str, Any]]) -> None:
         writer.writeheader()
         for row in rows:
             # csv 的类型存根将 fieldnames 推断为 Literal 联合；运行时允许普通 str 键字典
+            writer.writerow(cast(Any, row))
+        temporary = Path(handle.name)
+    temporary.replace(path)
+
+
+def _atomic_invalid_samples_csv(path: Path, rows: Sequence[Mapping[str, Any]]) -> None:
+    """写入被跳过样本的完整清单，避免 Markdown 报告因大量异常而过长。"""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    columns = ("source_index", "source_id", "metrics_path", "reason")
+    with tempfile.NamedTemporaryFile("w", encoding="utf-8", newline="", dir=path.parent, delete=False) as handle:
+        writer = csv.DictWriter(handle, fieldnames=columns, extrasaction="ignore")
+        writer.writeheader()
+        for row in rows:
             writer.writerow(cast(Any, row))
         temporary = Path(handle.name)
     temporary.replace(path)
@@ -584,6 +620,29 @@ def _metric_table(
     return lines
 
 
+def _invalid_samples_section(input_info: Mapping[str, Any]) -> list[str]:
+    """在报告中概述校验失败样本，并保留少量具体原因便于快速排查。"""
+    invalid_samples = cast(Sequence[Mapping[str, Any]], input_info["invalid_metrics_samples"])
+    if not invalid_samples:
+        return []
+
+    lines = [
+        "## 跳过的校验失败样本",
+        "",
+        f"共跳过 {len(invalid_samples)} 个样本；完整清单见同目录的 `invalid_samples.csv`。",
+        "",
+        "| 样本编号 | 样本 | 原因 |",
+        "|---:|---|---|",
+    ]
+    for item in invalid_samples[:20]:
+        index = "—" if item.get("source_index") is None else str(item["source_index"])
+        reason = str(item.get("reason", "未知校验错误")).replace("|", "\\|")
+        lines.append(f"| {index} | {item.get('source_id', '—')} | {reason} |")
+    if len(invalid_samples) > 20:
+        lines.append(f"| … | … | 其余 {len(invalid_samples) - 20} 个原因见 `invalid_samples.csv` |")
+    return lines
+
+
 def _build_report(summary: Mapping[str, Any], samples: Sequence[Mapping[str, Any]]) -> str:
     """生成不依赖额外库的中文 Markdown 性能报告"""
     input_info = _mapping(summary["input"], context="summary.input")
@@ -596,16 +655,23 @@ def _build_report(summary: Mapping[str, Any], samples: Sequence[Mapping[str, Any
         "",
         f"- 生成时间（UTC）：{summary['generated_at_utc']}",
         f"- 样本编号范围（summary_v5 配置）：{_format_requested_sample_range(input_info['requested_source_index_range'])}",
-        f"- 实际纳入样本：{input_info['sample_count']} 个",
+        f"- 有效纳入样本：{input_info['sample_count']} 个",
         f"- 方法：`{input_info['method']}`；时间步进：{input_info['time_stride']} 帧",
         f"- metrics schema：v{input_info['metrics_schema_version']}",
     ]
     missing = input_info["missing_metrics_source_indices"]
     if missing:
         lines.extend([f"- 缺少选定方法 metrics 的样本编号：{', '.join(map(str, missing))}"])
+    invalid_samples = cast(Sequence[Mapping[str, Any]], input_info["invalid_metrics_samples"])
+    if invalid_samples:
+        lines.extend([f"- 因 metrics 校验失败跳过：{len(invalid_samples)} 个"])
     lines.extend([""])
     lines.extend(_parameter_table(input_info))
     lines.extend([""])
+    invalid_section = _invalid_samples_section(input_info)
+    if invalid_section:
+        lines.extend(invalid_section)
+        lines.extend([""])
     lines.extend(
         _metric_table(
             "轨迹质量（逐样本统计）",
@@ -689,10 +755,10 @@ def main() -> None:
     """执行汇总，并将 JSON、CSV 和 Markdown 报告写入目标目录"""
     args = build_parser().parse_args()
 
-    args.run_dir = Path('/mnt/host-model/weixc/code/LineTracker/method/SimpleCNN/infer/_output/F300-N10k-S42--v2-n-best-s42000')
+    args.run_dir = Path('/mnt/host-model/weixc/code/LineTracker/method/SimpleCNN/infer/_output/F300-N10k-S42--v2-s-best-s48000')
     args.method_dir = 'adaptive_tracker_stride5'
 
-    summary, samples, missing_indices = build_summary(
+    summary, samples, missing_indices, invalid_samples = build_summary(
         args.run_dir,
         args.method_dir,
         sample_start=args.sample_start,
@@ -703,10 +769,13 @@ def main() -> None:
     output_dir = args.output_dir or args.run_dir / "summary" / default_name
     _atomic_json(output_dir / "summary.json", summary)
     _atomic_csv(output_dir / "per_sample.csv", samples)
+    _atomic_invalid_samples_csv(output_dir / "invalid_samples.csv", invalid_samples)
     _atomic_text(output_dir / "report.md", _build_report(summary, samples))
-    print(f"已汇总 {len(samples)} 个 schema v5 样本 -> {output_dir}")
+    print(f"已汇总 {len(samples)} 个通过校验的 schema v5 样本 -> {output_dir}")
     if missing_indices:
         print(f"警告：缺少 {args.method_dir} metrics 的样本编号：{missing_indices}")
+    if invalid_samples:
+        print(f"警告：跳过 {len(invalid_samples)} 个 metrics 校验失败样本；详见 {output_dir / 'invalid_samples.csv'}")
 
 
 if __name__ == "__main__":

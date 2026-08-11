@@ -768,6 +768,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
 
+    args.checkpoint = Path('/mnt/host-model/weixc/code/LineTracker/method/SimpleCNN/runs/simplecnn_v2/limit50k-gbs1024-lr5e-4-pos25-vs5-models-cfg11ba6304/20260728_113116/checkpoints/best.pt')
     args.method = 'adaptive_tracker'
     args.time_stride = 5
     args.samples_start = 0
