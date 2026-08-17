@@ -132,6 +132,53 @@
             "console": "integratedTerminal",
             "justMyCode": false,
             "subProcess": false
+        },
+        {
+            "name": "SimpleCNN · 多 NPU 样本并行推理 · NPU 0,1",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/method/SimpleCNN/infer/run_infer_parallel.py",
+            "args": [
+                "--method",
+                "adaptive_tracker",
+                "--devices",
+                "0,1"
+            ],
+            "cwd": "${workspaceFolder}/method/SimpleCNN",
+            "envFile": "${workspaceFolder}/method/SimpleCNN/.env",
+            "env": {
+                "LT_ACCELERATOR": "npu",
+                "CUDA_VISIBLE_DEVICES": "0",
+                "ASCEND_RT_VISIBLE_DEVICES": "0,1",
+                "OMP_NUM_THREADS": "1",
+                "ASCEND_GLOBAL_LOG_LEVEL": "3"
+            },
+            "console": "integratedTerminal",
+            "justMyCode": false,
+            "subProcess": true
+        },
+        {
+            "name": "SimpleCNN · 多 NPU 纯背景虚警评估 · NPU 0,1",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/method/SimpleCNN/infer/run_FA_eval_parallel.py",
+            "args": [
+                "--devices",
+                "0,1",
+                "--no-warmup"
+            ],
+            "cwd": "${workspaceFolder}/method/SimpleCNN",
+            "envFile": "${workspaceFolder}/method/SimpleCNN/.env",
+            "env": {
+                "LT_ACCELERATOR": "npu",
+                "CUDA_VISIBLE_DEVICES": "0",
+                "ASCEND_RT_VISIBLE_DEVICES": "0,1",
+                "OMP_NUM_THREADS": "1",
+                "ASCEND_GLOBAL_LOG_LEVEL": "3"
+            },
+            "console": "integratedTerminal",
+            "justMyCode": false,
+            "subProcess": true
         }
     ]
 }

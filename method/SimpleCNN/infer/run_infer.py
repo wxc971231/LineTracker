@@ -205,6 +205,7 @@ def _write_method_parameter_snapshot(
     checkpoint_step: int | str | None,
     method_config: GlobalTop1Config | AdaptiveInferenceConfig,
     complexity: ModelComplexity,
+    effective_device: str | None = None,
 ) -> Path:
     """按方法目录名保存本次实际推理参数，供离线汇总报告复现使用。"""
     method_dir = _sample_file_stem(args.method, args.time_stride)
@@ -218,7 +219,7 @@ def _write_method_parameter_snapshot(
         "resolved_config_path": bundle.resolved_config_path,
         "data_root": bundle.config.data_root,
         "requested_device": args.device,
-        "effective_device": str(bundle.device),
+        "effective_device": str(bundle.device) if effective_device is None else effective_device,
         "common": {
             "max_blocks_per_forward": args.max_blocks_per_forward,
             "jump_threshold_m": args.jump_threshold_m,

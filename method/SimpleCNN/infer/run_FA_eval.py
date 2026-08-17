@@ -304,6 +304,65 @@ def _output_dir(*, data_root: Path, checkpoint_path: Path, checkpoint_step: obje
     return path
 
 
+def _evaluate_source(
+    source: PackedSource,
+    *,
+    runner: ModelRunner,
+    method_config: Any,
+    tracker_config: Any,
+    complexity: Any,
+    output_dir: Path,
+    args: argparse.Namespace,
+    logger: Any,
+) -> FalseAlarmSummary:
+    """运行并落盘一个纯背景样本，供单卡和多 NPU 入口共同调用。"""
+    _assert_pure_background(source)
+    result = run_adaptive_source(source, runner, runner.config, method_config, tracker_config)
+    false_alarm = _source_false_alarm_summary(
+        result,
+        frames=source.frames,
+        frames_per_window=runner.config.frames_per_window,
+        frame_interval_s=_FRAME_INTERVAL_S,
+    )
+    workload = result["workload"]
+    if not isinstance(workload, Mapping):
+        raise TypeError("adaptive_tracker 推理结果的 workload 必须为字典。")
+    sample_dir = output_dir / "samples" / safe_name(source.record.source_id)
+    sample_dir.mkdir(parents=True, exist_ok=True)
+    figure_error: str | None = None
+    if args.save_figures and false_alarm["false_alarm_frames_including_unreliable"]:
+        try:
+            figure = plot_false_alarm_diagnostic(
+                source,
+                result,
+                config=runner.config,
+                title=f"adaptive_tracker 纯背景虚警：{source.record.source_id}",
+                false_alarm=false_alarm,
+                capture_q_min=method_config.capture_q_min,
+                q_keep=method_config.q_keep,
+                frame_interval_s=_FRAME_INTERVAL_S,
+            )
+            figure.savefig(sample_dir / "visualize.png", dpi=args.figure_dpi)
+            import matplotlib.pyplot as plt
+
+            plt.close(figure)
+        except Exception as error:
+            figure_error = f"{type(error).__name__}: {error}"
+            logger.exception("样本 %s 的虚警诊断图保存失败。", source.record.source_id)
+    payload: dict[str, Any] = {
+        "schema_version": 2,
+        "source_id": source.record.source_id,
+        "method": "adaptive_tracker",
+        "false_alarm": false_alarm,
+        "compute": _sample_compute_summary(complexity, workload),
+        "timing": _timing_summary("adaptive_tracker", result),
+    }
+    if figure_error is not None:
+        payload["figure_error"] = figure_error
+    write_json(sample_dir / "metrics.json", payload)
+    return false_alarm
+
+
 def run(args: argparse.Namespace) -> Path:
     """在全部选定纯背景样本上运行 adaptive_tracker 并写出虚警统计。"""
     bundle = load_inference_bundle(args.checkpoint, data_root=args.data_root, device=args.device)
@@ -362,51 +421,17 @@ def run(args: argparse.Namespace) -> Path:
     source_summaries: list[FalseAlarmSummary] = []
     for offset, record in enumerate(selected_records):
         source = first_source if offset == 0 and first_source is not None else PackedSource(record, bundle.config)
-        _assert_pure_background(source)
-        result = run_adaptive_source(source, runner, bundle.config, method_config, tracker_config)
-        false_alarm = _source_false_alarm_summary(
-            result,
-            frames=source.frames,
-            frames_per_window=bundle.config.frames_per_window,
-            frame_interval_s=_FRAME_INTERVAL_S,
+        false_alarm = _evaluate_source(
+            source,
+            runner=runner,
+            method_config=method_config,
+            tracker_config=tracker_config,
+            complexity=complexity,
+            output_dir=output_dir,
+            args=args,
+            logger=logger,
         )
         source_summaries.append(false_alarm)
-        workload = result["workload"]
-        if not isinstance(workload, Mapping):
-            raise TypeError("adaptive_tracker 推理结果的 workload 必须为字典。")
-        sample_dir = output_dir / "samples" / safe_name(record.source_id)
-        sample_dir.mkdir(parents=True, exist_ok=True)
-        figure_error: str | None = None
-        if args.save_figures and false_alarm["false_alarm_frames_including_unreliable"]:
-            try:
-                figure = plot_false_alarm_diagnostic(
-                    source,
-                    result,
-                    config=bundle.config,
-                    title=f"adaptive_tracker 纯背景虚警：{record.source_id}",
-                    false_alarm=false_alarm,
-                    capture_q_min=method_config.capture_q_min,
-                    q_keep=method_config.q_keep,
-                    frame_interval_s=_FRAME_INTERVAL_S,
-                )
-                figure.savefig(sample_dir / "visualize.png", dpi=args.figure_dpi)
-                import matplotlib.pyplot as plt
-
-                plt.close(figure)
-            except Exception as error:
-                figure_error = f"{type(error).__name__}: {error}"
-                logger.exception("样本 %s 的虚警诊断图保存失败。", record.source_id)
-        payload: dict[str, Any] = {
-            "schema_version": 2,
-            "source_id": record.source_id,
-            "method": "adaptive_tracker",
-            "false_alarm": false_alarm,
-            "compute": _sample_compute_summary(complexity, workload),
-            "timing": _timing_summary("adaptive_tracker", result),
-        }
-        if figure_error is not None:
-            payload["figure_error"] = figure_error
-        write_json(sample_dir / "metrics.json", payload)
         logger.info(
             "[%d/%d] source=%s FAR=%.3f%% (含外推 %.3f%%) events=%d (含外推 %d)",
             offset + 1,
