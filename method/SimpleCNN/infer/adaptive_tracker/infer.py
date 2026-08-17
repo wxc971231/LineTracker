@@ -22,6 +22,7 @@ class AdaptiveInferenceConfig:
     capture_buffer_size: int = 8
     capture_support_ratio: float = 0.7
     capture_radius_m: float = 500.0
+    capture_q_min: float = 0.5
     q_keep: float = 0.5
     instant_speed_gate_mpf: tuple[float, ...] = (17.0, 25.0, 34.0)
     average_speed_gate_mpf: tuple[float, ...] = (17.0, 25.0, 34.0)
@@ -37,6 +38,7 @@ class AdaptiveInferenceConfig:
             capture_buffer_size=self.capture_buffer_size,
             capture_support_ratio=self.capture_support_ratio,
             capture_radius_m=self.capture_radius_m,
+            capture_q_min=self.capture_q_min,
             q_keep=self.q_keep,
             instant_speed_gate_mpf=self.instant_speed_gate_mpf,
             average_speed_gate_mpf=self.average_speed_gate_mpf,

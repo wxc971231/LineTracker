@@ -57,6 +57,7 @@ class InferEntryTests(unittest.TestCase):
         )
         self.assertTrue(enabled.warmup)
         self.assertTrue(enabled.save_figures)
+        self.assertEqual(enabled.capture_q_min, 0.5)
         self.assertEqual(enabled.instant_speed_gates_mpf, "20,25,30")
         self.assertEqual(enabled.average_speed_gates_mpf, "17,25,34")
         self.assertEqual(enabled.speed_average_window_frames, 10)
@@ -70,6 +71,17 @@ class InferEntryTests(unittest.TestCase):
             args: Any = SimpleNamespace(samples_start=0, samples_stop=2)  # 仅覆盖该函数读取的参数。
             records = _select_records(bundle, args)
         self.assertEqual([record.source_id for record in records], ["dataset1_synthetic_0000", "dataset1_synthetic_0002"])
+
+    def test_select_records_rejects_empty_or_reversed_ranges(self) -> None:
+        with TemporaryDirectory() as temporary:
+            data_root = Path(temporary)
+            (data_root / "dataset1_synthetic_0000").mkdir()
+            bundle: Any = SimpleNamespace(config=SimpleNamespace(data_root=data_root))
+
+            with self.assertRaisesRegex(ValueError, "不能小于"):
+                _select_records(bundle, SimpleNamespace(sample_start=1, sample_stop=0))
+            with self.assertRaisesRegex(ValueError, "范围为空"):
+                _select_records(bundle, SimpleNamespace(sample_start=1, sample_stop=None))
 
     def test_first_output_frame_follows_actual_prediction_not_window_size(self) -> None:
         self.assertEqual(_first_output_frame(np.asarray([np.nan, np.nan, 1.0])), 2)

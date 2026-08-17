@@ -14,7 +14,7 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Iterable, cast
 
 import h5py
 import numpy as np
@@ -63,7 +63,9 @@ def _find_hdf5_matrix(path: Path) -> tuple[str, tuple[int, int]]:
         def visitor(name: str, node: h5py.Dataset | h5py.Group) -> None:
             """收集距离维长度为 RANGE_BINS 的二维数据集。"""
             if isinstance(node, h5py.Dataset) and node.ndim == 2 and RANGE_BINS in node.shape:
-                candidates.append((name, tuple(int(value) for value in node.shape)))
+                # node.ndim 已确认是二维；显式拆包以保留 tuple[int, int] 类型信息。
+                rows, columns = (int(value) for value in node.shape)
+                candidates.append((name, (rows, columns)))
 
         handle.visititems(visitor)
     if len(candidates) != 1:
@@ -124,6 +126,8 @@ def profile_real_sample(
 
     with h5py.File(path, "r") as handle:
         dataset = handle[variable]
+        if not isinstance(dataset, h5py.Dataset):
+            raise TypeError(f"{path}: {variable!r} 不是 HDF5 数据集。")
         for start in range(0, RANGE_BINS, chunk_range_bins):
             stop = min(start + chunk_range_bins, RANGE_BINS)
             group_start = start // profile_width_m
@@ -367,7 +371,9 @@ def save_model(
     summary_path = Path(summary_path)
     model_path.parent.mkdir(parents=True, exist_ok=True)
     summary_path.parent.mkdir(parents=True, exist_ok=True)
-    np.savez_compressed(model_path, **model)
+    # NumPy 的类型桩无法表达 ``**model`` 这种同名数组的动态关键字参数；
+    # 运行时仍按原样保存 NPZ 中的每个模型数组。
+    np.savez_compressed(model_path, **cast(Any, model))
     summary_path.write_text(
         json.dumps(_jsonable(summary), ensure_ascii=False, indent=2) + "\n",
         encoding="utf-8",

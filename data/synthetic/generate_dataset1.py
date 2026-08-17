@@ -894,8 +894,17 @@ def generate_sample(
     target = generate_target(
         np.asarray(metadata["target_probability_1m"], dtype=np.float64),
         frames=frames,
+        range_min_m=float(target_config["range_min_m"]),
+        range_max_m=float(target_config["range_max_m"]),
+        max_speed_mps=float(target_config["max_speed_mps"]),
+        max_acceleration_mps2=float(target_config["max_acceleration_mps2"]),
+        curve_strength=float(target_config["curve_strength"]),
+        smooth_window_frames=int(target_config["smooth_window_frames"]),
+        measurement_jitter_std_m=float(target_config["measurement_jitter_std_m"]),
+        response_multiplier=float(target_config["response_multiplier"]),
+        min_injection_probability=float(target_config["min_injection_probability"]),
+        max_injection_probability=float(target_config["max_injection_probability"]),
         rng=np.random.default_rng(target_seed),
-        **target_config,
     )
     observation = overlay_target(background, target)
 

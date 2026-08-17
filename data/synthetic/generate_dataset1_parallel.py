@@ -121,6 +121,14 @@ def build_parallel_parser() -> argparse.ArgumentParser:
         default=2,
         help="并行子进程数；建议从 2 开始，根据内存和磁盘带宽酌情增大",
     )
+    parser.set_defaults(
+        samples=1_000,
+        workers=5,
+        seed=20260816,
+        response_multiplier=0.0,
+        min_injection_probability=0.0,
+        max_injection_probability=0.0,
+    )
     return parser
 
 
@@ -128,9 +136,6 @@ def main(argv: Iterable[str] | None = None) -> None:
     """并行调度样本生成，并在主进程统一写出批次清单。"""
     parser = build_parallel_parser()
     args = parser.parse_args(argv)
-
-    # args.samples = 200
-    # args.workers = 5
 
     if args.samples <= 0:
         parser.error("--samples 必须为正整数")

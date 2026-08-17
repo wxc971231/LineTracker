@@ -25,15 +25,23 @@ _PLOT_FIELDS = (
     "target_hit",
     "target_hit_bin",
 )
+_FALSE_ALARM_PLOT_FIELDS = (
+    "background_only_packed",
+    "background_probability_1m",
+)
 
 
-def _load_plot_data(source: PackedSource) -> dict[str, np.ndarray]:
-    """从当前推理样本的完整 NPZ 读取诊断图必需字段。"""
+def _load_plot_data(
+    source: PackedSource,
+    *,
+    fields: Sequence[str] = _PLOT_FIELDS,
+) -> dict[str, np.ndarray]:
+    """从当前推理样本的 NPZ 读取指定诊断图字段。"""
     with np.load(source.record.path, allow_pickle=False) as archive:
-        missing = set(_PLOT_FIELDS).difference(archive.files)
+        missing = set(fields).difference(archive.files)
         if missing:
             raise KeyError(f"{source.record.path} 缺少诊断图字段：{sorted(missing)}")
-        return {name: archive[name] for name in _PLOT_FIELDS}
+        return {name: archive[name] for name in fields}
 
 
 def _unpack_local_range(
@@ -438,6 +446,227 @@ def plot_source_diagnostic(
             xlabel="时间（秒）",
             ylabel="距离（千米）",
             ylim=local_y_limits,
+        )
+        prediction_axis.legend(fontsize=8, loc="upper right")
+        _style_axis(prediction_axis)
+        _apply_chinese_font(figure)
+
+    return figure
+
+
+def plot_false_alarm_diagnostic(
+    source: PackedSource,
+    result: Mapping[str, Any],
+    *,
+    config: SimpleCNNConfig,
+    title: str,
+    false_alarm: Mapping[str, Any],
+    capture_q_min: float,
+    q_keep: float,
+    frame_interval_s: float = 0.05,
+    margin_m: float = 5_000.0,
+    point_size: float = 1.0,
+    probability_bin_m: int = 1_000,
+) -> Any:
+    """绘制纯背景样本的虚警诊断图，不使用潜在目标轨迹或目标标签。"""
+    if not np.isfinite(frame_interval_s) or frame_interval_s <= 0.0:
+        raise ValueError("frame_interval_s 必须为正有限数。")
+    if not np.isfinite(margin_m) or margin_m < 0.0:
+        raise ValueError("margin_m 必须为非负有限数。")
+    if point_size <= 0.0:
+        raise ValueError("point_size 必须为正。")
+    if not np.isfinite(capture_q_min) or not 0.0 <= capture_q_min <= 1.0:
+        raise ValueError("capture_q_min 必须在 [0, 1] 内。")
+    if not np.isfinite(q_keep) or not 0.0 <= q_keep <= 1.0:
+        raise ValueError("q_keep 必须在 [0, 1] 内。")
+
+    import matplotlib.pyplot as plt
+
+    data = _load_plot_data(source, fields=_FALSE_ALARM_PLOT_FIELDS)
+    range_bins = int(config.range_bins)
+    prediction_m = np.asarray(result["prediction_m"], dtype=np.float64).reshape(-1)
+    if prediction_m.shape != (source.frames,):
+        raise ValueError("prediction_m 必须与完整帧轴等长。")
+    finite_prediction = np.isfinite(prediction_m)
+    if not np.any(finite_prediction):
+        raise ValueError("样本没有可绘制的虚警预测。")
+
+    steps = result.get("steps", ())
+    if not isinstance(steps, Sequence) or isinstance(steps, (str, bytes)):
+        raise TypeError("推理结果 steps 必须为逐窗记录序列。")
+    if not all(isinstance(step, Mapping) for step in steps):
+        raise TypeError("推理结果 steps 必须全部为字典。")
+    mode, measurement_updated = _status_series(steps, source.frames)
+
+    range_start = max(0, int(math.floor(float(np.min(prediction_m[finite_prediction])) - margin_m)))
+    range_stop = min(
+        range_bins,
+        int(math.ceil(float(np.max(prediction_m[finite_prediction])) + margin_m + 1.0)),
+    )
+    if range_stop <= range_start:
+        range_stop = min(range_bins, range_start + 1)
+    local_background = _unpack_local_range(
+        data["background_only_packed"], range_start, range_stop, bitorder=config.packed_bitorder
+    )
+    probability = _background_probability(data, range_bins=range_bins)
+    probability_centres_km, probability_values = _coarsen_probability(
+        probability, int(probability_bin_m)
+    )
+    time_seconds = np.arange(source.frames, dtype=np.float64) * frame_interval_s
+    background_frames, background_bins = np.nonzero(local_background)
+    y_limits = (range_start / 1_000.0, range_stop / 1_000.0)
+    first_output = _first_output_frame(prediction_m)
+
+    step_frames = np.asarray(
+        [int(step["frame"]) for step in steps if "frame" in step and "candidate_q" in step],
+        dtype=np.int32,
+    )
+    step_q = np.asarray(
+        [float(step["candidate_q"]) for step in steps if "frame" in step and "candidate_q" in step],
+        dtype=np.float64,
+    )
+
+    with plt.rc_context(
+        {
+            "font.family": "sans-serif",
+            "font.sans-serif": ["Noto Sans CJK SC", "WenQuanYi Micro Hei", "SimHei", "DejaVu Sans"],
+            "axes.unicode_minus": False,
+        }
+    ):
+        figure, axes = plt.subplots(2, 2, figsize=(16.0, 10.2), constrained_layout=True)
+        figure.suptitle(title, fontsize=15, fontweight="normal")
+
+        probability_axis = axes[0, 0]
+        probability_axis.semilogy(
+            probability_centres_km,
+            np.maximum(probability_values, np.finfo(np.float64).tiny),
+            color="#4C78A8",
+            linewidth=1.3,
+        )
+        probability_axis.axvspan(
+            range_start / 1_000.0,
+            range_stop / 1_000.0,
+            color="#E64B35",
+            alpha=0.16,
+            label="虚警轨迹覆盖距离",
+        )
+        probability_axis.set(
+            title="拟合背景占据概率",
+            xlabel="距离（千米）",
+            ylabel="每米距离单元的占据概率",
+            xlim=(0.0, range_bins / 1_000.0),
+        )
+        probability_axis.legend(fontsize=8, loc="upper right")
+        _style_axis(probability_axis)
+
+        noise_axis = axes[0, 1]
+        noise_axis.scatter(
+            time_seconds[background_frames],
+            (range_start + background_bins) / 1_000.0,
+            s=point_size,
+            marker="s",
+            linewidths=0,
+            alpha=0.6,
+            color="#4C9AD4",
+            rasterized=True,
+            label="纯背景二值响应",
+        )
+        noise_axis.set(
+            title="虚警距离附近的纯噪声时距图",
+            xlabel="时间（秒）",
+            ylabel="距离（千米）",
+            ylim=y_limits,
+        )
+        noise_axis.legend(fontsize=8, loc="upper right")
+        _style_axis(noise_axis)
+
+        confidence_axis = axes[1, 0]
+        if step_frames.size:
+            confidence_axis.plot(
+                time_seconds[step_frames], step_q, color="#4C78A8", linewidth=1.25, marker="o", markersize=3.2,
+                label="当前窗口 q-Top1",
+            )
+        confidence_axis.axhline(
+            capture_q_min,
+            color="#F0A202",
+            linewidth=1.1,
+            linestyle="--",
+            label="capture_q_min（捕获）",
+        )
+        confidence_axis.axhline(
+            q_keep,
+            color="#E64B35",
+            linewidth=1.1,
+            linestyle=":",
+            label="q_keep（TRACK）",
+        )
+        confidence_axis.set(
+            title="候选置信度与跟踪状态",
+            xlabel="时间（秒）",
+            ylabel="q",
+            ylim=(0.0, 1.0),
+        )
+        mode_colors = {"CAPTURE": "#F0A202", "TRACK": "#E64B35", "RECAPTURE": "#8E5EA2"}
+        shown_modes: set[str] = set()
+        for step in steps:
+            if "forecast_frame_start" not in step or "forecast_frame_stop" not in step:
+                continue
+            mode_name = str(step.get("mode", "")).upper()
+            color = mode_colors.get(mode_name, "#777777")
+            start_s = int(step["forecast_frame_start"]) * frame_interval_s
+            stop_s = int(step["forecast_frame_stop"]) * frame_interval_s
+            confidence_axis.axvspan(
+                start_s,
+                stop_s,
+                color=color,
+                alpha=0.10,
+                label=mode_name if mode_name and mode_name not in shown_modes else None,
+                zorder=0,
+            )
+            shown_modes.add(mode_name)
+        confidence_axis.legend(fontsize=8, loc="upper right", ncols=2)
+        _style_axis(confidence_axis)
+
+        prediction_axis = axes[1, 1]
+        prediction_axis.scatter(
+            time_seconds[background_frames],
+            (range_start + background_bins) / 1_000.0,
+            s=point_size,
+            marker="s",
+            linewidths=0,
+            alpha=0.44,
+            color="#4C9AD4",
+            rasterized=True,
+            label="背景响应",
+        )
+        _plot_prediction_segments(
+            prediction_axis,
+            time_seconds=time_seconds,
+            prediction_m=prediction_m,
+            mode=mode,
+            measurement_updated=measurement_updated,
+        )
+        if first_output > 0:
+            prediction_axis.axvspan(
+                0.0,
+                min(source.frames, first_output) * frame_interval_s,
+                color="#777777",
+                alpha=0.08,
+                label="首次报警前阶段",
+                zorder=0,
+            )
+        prediction_axis.set(
+            title=(
+                "虚警轨迹："
+                f"FAR {_format_metric(false_alarm.get('false_alarm_frame_rate'), '.1%')}，"
+                f"含外推 {_format_metric(false_alarm.get('false_alarm_frame_rate_including_unreliable'), '.1%')}，"
+                f"事件 {false_alarm.get('false_alarm_event_count', '—')}，"
+                f"可靠帧 {false_alarm.get('reliable_false_alarm_frames', '—')}，"
+                f"重捕获外推帧 {false_alarm.get('unreliable_false_alarm_frames', '—')}"
+            ),
+            xlabel="时间（秒）",
+            ylabel="距离（千米）",
+            ylim=y_limits,
         )
         prediction_axis.legend(fontsize=8, loc="upper right")
         _style_axis(prediction_axis)

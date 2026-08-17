@@ -1,8 +1,8 @@
 {
+    "venvPath": "/home/pc5090/Programmer/miniconda3/envs",
     "venv": "linetracker-py311",
     "pythonVersion": "3.11",
     "exclude": [
-        "data",
         "**/runs",
         "**/wandb",
         "**/__pycache__",

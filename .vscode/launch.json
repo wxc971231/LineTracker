@@ -109,6 +109,29 @@
             "console": "integratedTerminal",
             "justMyCode": false,
             "subProcess": false
+        },
+        {
+            "name": "SimpleCNN · 单卡纯背景虚警评估 · CUDA/NPU auto",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/method/SimpleCNN/infer/run_FA_eval.py",
+            "args": [
+                "--device",
+                "auto",
+                "--no-warmup"
+            ],
+            "cwd": "${workspaceFolder}/method/SimpleCNN",
+            "envFile": "${workspaceFolder}/method/SimpleCNN/.env",
+            "env": {
+                "LT_ACCELERATOR": "auto",
+                "CUDA_VISIBLE_DEVICES": "0",
+                "ASCEND_RT_VISIBLE_DEVICES": "0",
+                "OMP_NUM_THREADS": "1",
+                "ASCEND_GLOBAL_LOG_LEVEL": "3"
+            },
+            "console": "integratedTerminal",
+            "justMyCode": false,
+            "subProcess": false
         }
     ]
 }

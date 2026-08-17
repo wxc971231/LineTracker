@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 from collections.abc import Mapping, Sequence
+from dataclasses import asdict
 import logging
 import math
 import re
@@ -110,7 +111,12 @@ def _select_records(bundle: InferenceBundle, args: argparse.Namespace) -> list[S
     """稳定选取 data_root 按 source_id 排序后的前 N 个一级样本目录。"""
     records = sorted(discover_sources(bundle.config.data_root), key=lambda record: record.source_id)
     sample_start, sample_stop = _effective_sample_bounds(args)
-    return records[sample_start:sample_stop]
+    if sample_stop is not None and sample_stop < sample_start:
+        raise ValueError("--sample-stop 不能小于 --sample-start。")
+    selected = records[sample_start:sample_stop]
+    if not selected:
+        raise ValueError("所选样本范围为空，请检查 --sample-start 和 --sample-stop。")
+    return selected
 
 
 def _sample_file_stem(method: str, time_stride: int) -> str:
@@ -135,31 +141,60 @@ def _figure_title(method: str, source_id: str, time_stride: int) -> str:
     return f"{method.replace('_', '-')}-{data_label}：时间步进 {time_stride}"
 
 
+def adaptive_config_from_args(args: argparse.Namespace) -> AdaptiveInferenceConfig:
+    """将两个推理入口共享的命令行参数转换为自适应状态机配置。"""
+    instant_speed_gates = tuple(
+        _csv_values(args.instant_speed_gates_mpf, float, "instant_speed_gates_mpf")
+    )
+    average_speed_gates = tuple(
+        _csv_values(args.average_speed_gates_mpf, float, "average_speed_gates_mpf")
+    )
+    if len(instant_speed_gates) != 3 or len(average_speed_gates) != 3:
+        raise ValueError("两类 speed gates 都必须恰好提供 L=0/1/2 三个门限。")
+    return AdaptiveInferenceConfig(
+        time_stride=args.time_stride,
+        capture_stride=args.capture_stride,
+        capture_buffer_size=args.capture_buffer_size,
+        capture_support_ratio=args.capture_support_ratio,
+        capture_radius_m=args.capture_radius_m,
+        capture_q_min=args.capture_q_min,
+        q_keep=args.q_keep,
+        instant_speed_gate_mpf=instant_speed_gates,
+        average_speed_gate_mpf=average_speed_gates,
+        speed_average_window_frames=args.speed_average_window_frames,
+        expand_after_bad=args.expand_after_bad,
+        shrink_after_good=args.shrink_after_good,
+        alpha=args.alpha,
+        beta=args.beta,
+        gamma=args.gamma,
+    )
+
+
 def _method_config(args: argparse.Namespace) -> GlobalTop1Config | AdaptiveInferenceConfig:
     if args.method == "global_top1":
         return GlobalTop1Config(time_stride=args.time_stride)
-    elif args.method == "adaptive_tracker":
-        instant_speed_gates = tuple(_csv_values(args.instant_speed_gates_mpf, float, "instant_speed_gates_mpf"))
-        average_speed_gates = tuple(_csv_values(args.average_speed_gates_mpf, float, "average_speed_gates_mpf"))
-        assert len(instant_speed_gates) == len(average_speed_gates) == 3, "两类 speed gates 都必须恰好提供 L=0/1/2 三个门限。"
-        return AdaptiveInferenceConfig(
-            time_stride=args.time_stride,
-            capture_stride=args.capture_stride,
-            capture_buffer_size=args.capture_buffer_size,
-            capture_support_ratio=args.capture_support_ratio,
-            capture_radius_m=args.capture_radius_m,
-            q_keep=args.q_keep,
-            instant_speed_gate_mpf=instant_speed_gates,
-            average_speed_gate_mpf=average_speed_gates,
-            speed_average_window_frames=args.speed_average_window_frames,
-            expand_after_bad=args.expand_after_bad,
-            shrink_after_good=args.shrink_after_good,
-            alpha=args.alpha,
-            beta=args.beta,
-            gamma=args.gamma,
-        )
-    else:
-        raise ValueError(f"不支持的推理方法：{args.method!r}。")
+    if args.method == "adaptive_tracker":
+        return adaptive_config_from_args(args)
+    raise ValueError(f"不支持的推理方法：{args.method!r}。")
+
+
+def add_adaptive_tracker_arguments(parser: argparse.ArgumentParser, *, title: str) -> None:
+    """为所有 adaptive_tracker 入口注册同一组状态机参数。"""
+    adaptive = parser.add_argument_group(title)
+    adaptive.add_argument("--capture-stride", type=_positive_int, default=2, help="CAPTURE/RECAPTURE 相邻全局扫描窗口的时间步进（帧）。")
+    adaptive.add_argument("--capture-buffer-size", type=_positive_int, default=8, help="稳定捕获判断使用的连续全局扫描候选数量。")
+    adaptive.add_argument("--capture-support-ratio", type=_finite_float, default=0.7, help="捕获成功所需候选支持比例，取值必须在 (0, 1] 内。")
+    adaptive.add_argument("--capture-radius-m", type=_finite_float, default=500.0, help="CAPTURE/RECAPTURE 候选聚类半径（米）。")
+    adaptive.add_argument("--capture-q-min", type=_finite_float, default=0.5, help="CAPTURE/RECAPTURE 候选进入捕获缓存所需的最低预测 q 值。")
+    adaptive.add_argument("--q-keep", type=_finite_float, default=0.5, help="保留候选并判定跟踪成功所需的最低预测 q 值。")
+    adaptive.add_argument("--instant-speed-gates-mpf", default="20,25,30", help="L=0/1/2 的单帧融合状态绝对速度上限（米/帧）。")
+    adaptive.add_argument("--average-speed-gates-mpf", default="17,25,34", help="L=0/1/2 的最近 N 帧状态位移平均速度上限（米/帧）。")
+    adaptive.add_argument("--speed-average-window-frames", type=_positive_int, default=10, help="平均速度门控的历史窗口长度（帧）。")
+    adaptive.add_argument("--expand-after-bad", type=_positive_int, default=2, help="连续失败达到该次数后，将局部搜索等级扩大一级。")
+    adaptive.add_argument("--shrink-after-good", type=_positive_int, default=4, help="连续成功达到该次数后，将局部搜索等级缩小一级。")
+    adaptive.add_argument("--alpha", type=_finite_float, default=0.8, help="alpha-beta 预测器的位置更新系数。")
+    adaptive.add_argument("--beta", type=_finite_float, default=0.1, help="alpha-beta 预测器的速度更新系数。")
+    adaptive.add_argument("--gamma", type=_finite_float, default=0.0, help="候选速度与 alpha-beta 速度融合权重。")
 
 
 def _write_method_parameter_snapshot(
@@ -194,21 +229,7 @@ def _write_method_parameter_snapshot(
         "model_complexity_per_block": _static_model_complexity(complexity),
     }
     if isinstance(method_config, AdaptiveInferenceConfig):
-        payload["adaptive_tracker"] = {
-            "capture_stride": method_config.capture_stride,
-            "capture_buffer_size": method_config.capture_buffer_size,
-            "capture_support_ratio": method_config.capture_support_ratio,
-            "capture_radius_m": method_config.capture_radius_m,
-            "q_keep": method_config.q_keep,
-            "instant_speed_gate_mpf": method_config.instant_speed_gate_mpf,
-            "average_speed_gate_mpf": method_config.average_speed_gate_mpf,
-            "speed_average_window_frames": method_config.speed_average_window_frames,
-            "expand_after_bad": method_config.expand_after_bad,
-            "shrink_after_good": method_config.shrink_after_good,
-            "alpha": method_config.alpha,
-            "beta": method_config.beta,
-            "gamma": method_config.gamma,
-        }
+        payload["adaptive_tracker"] = asdict(method_config)
     else:
         payload["global_top1"] = {"time_stride": method_config.time_stride}
     destination = output_dir / f"{method_dir}.json"
@@ -685,82 +706,8 @@ def build_parser() -> argparse.ArgumentParser:
         help="是否生成每个样本的中文 2×2 诊断图。",
     )
 
-    adaptive = parser.add_argument_group("adaptive_tracker 参数（仅 --method adaptive_tracker 生效）")
-    adaptive.add_argument(
-        "--capture-stride",
-        type=_positive_int,
-        default=2,
-        help="CAPTURE/RECAPTURE 相邻全局扫描窗口的时间步进（帧）。",
-    )
-    adaptive.add_argument(
-        "--capture-buffer-size",
-        type=_positive_int,
-        default=8,
-        help="稳定捕获判断使用的连续全局扫描候选数量。",
-    )
-    adaptive.add_argument(
-        "--capture-support-ratio",
-        type=_finite_float,
-        default=0.7,
-        help="捕获成功所需的候选支持比例，取值必须在 (0, 1] 内。",
-    )
-    adaptive.add_argument(
-        "--capture-radius-m",
-        type=_finite_float,
-        default=500.0,
-        help="CAPTURE/RECAPTURE 候选聚类半径（米）。",
-    )
-    adaptive.add_argument(
-        "--q-keep",
-        type=_finite_float,
-        default=0.5,
-        help="保留候选并判定跟踪成功所需的最低预测 q 值。",
-    )
-    adaptive.add_argument(
-        "--instant-speed-gates-mpf",
-        default="20,25,30",
-        help="L=0/1/2 的单帧融合状态绝对速度上限（米/帧）。",
-    )
-    adaptive.add_argument(
-        "--average-speed-gates-mpf",
-        default="17,25,34",
-        help="L=0/1/2 的最近 N 帧状态位移平均速度上限（米/帧）。",
-    )
-    adaptive.add_argument(
-        "--speed-average-window-frames",
-        type=_positive_int,
-        default=10,
-        help="平均速度门控的历史窗口长度（帧）。",
-    )
-    adaptive.add_argument(
-        "--expand-after-bad",
-        type=_positive_int,
-        default=2,
-        help="连续失败达到该次数后，将局部搜索等级扩大一级。",
-    )
-    adaptive.add_argument(
-        "--shrink-after-good",
-        type=_positive_int,
-        default=4,
-        help="连续成功达到该次数后，将局部搜索等级缩小一级。",
-    )
-    adaptive.add_argument(
-        "--alpha",
-        type=_finite_float,
-        default=0.8,
-        help="α-β 预测器的位置更新系数 α，取值必须在 [0, 1] 内。",
-    )
-    adaptive.add_argument(
-        "--beta",
-        type=_finite_float,
-        default=0.1,
-        help="α-β 预测器的速度更新系数 β，必须非负。",
-    )
-    adaptive.add_argument(
-        "--gamma",
-        type=_finite_float,
-        default=0.0,
-        help="候选速度与 α-β 速度融合权重 γ，取值必须在 [0, 1] 内。",
+    add_adaptive_tracker_arguments(
+        parser, title="adaptive_tracker 参数（仅 --method adaptive_tracker 生效）"
     )
     return parser
 

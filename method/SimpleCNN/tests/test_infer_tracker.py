@@ -28,6 +28,7 @@ class AdaptiveTrackerTests(unittest.TestCase):
             "capture_buffer_size": 3,
             "capture_support_ratio": 0.67,
             "capture_radius_m": 0.5,
+            "capture_q_min": 0.5,
             "q_keep": 0.5,
             "instant_speed_gate_mpf": (10.0, 20.0, 30.0),
             "average_speed_gate_mpf": (10.0, 20.0, 30.0),
@@ -52,11 +53,11 @@ class AdaptiveTrackerTests(unittest.TestCase):
 
     def _capture(self, tracker: AdaptiveTracker) -> None:
         """在 t=4 捕获匀速 2 m/frame 的轨迹，当前距离应为 108 m。"""
-        first = tracker.step(0, self._candidate(0.2, 100.0))
+        first = tracker.step(0, self._candidate(0.9, 100.0))
         self.assertEqual(first.mode, TrackerMode.CAPTURE)
-        second = tracker.step(2, self._candidate(0.2, 104.0))
+        second = tracker.step(2, self._candidate(0.9, 104.0))
         self.assertEqual(second.mode, TrackerMode.CAPTURE)
-        final = tracker.step(4, self._candidate(0.2, 108.0))
+        final = tracker.step(4, self._candidate(0.9, 108.0))
         self.assertEqual(final.mode, TrackerMode.TRACK)
         self.assertTrue(final.capture_confirmed)
         self.assertTrue(final.measurement_updated)
@@ -81,9 +82,9 @@ class AdaptiveTrackerTests(unittest.TestCase):
         )
         # 前三次候选外推到 t=4 都是 104；两次远距离误报不能破坏中位捕获。
         records = (
-            (0, self._candidate(0.1, 100.0, 1.0)),
+            (0, self._candidate(0.9, 100.0, 1.0)),
             (1, self._candidate(0.9, 101.0, 1.0)),
-            (2, self._candidate(0.4, 102.0, 1.0)),
+            (2, self._candidate(0.9, 102.0, 1.0)),
             (3, self._candidate(0.99, 5_000.0, 0.0)),
             (4, self._candidate(0.99, 8_000.0, 0.0)),
         )
@@ -96,6 +97,22 @@ class AdaptiveTrackerTests(unittest.TestCase):
         self.assertEqual(diagnostics.capture_support_count, 3)
         self.assertAlmostEqual(diagnostics.range_current_m or 0.0, 104.0)
         self.assertAlmostEqual(diagnostics.speed_m_per_frame or 0.0, 1.0)
+
+    def test_capture_requires_capture_q_min_before_caching_candidates(self) -> None:
+        tracker = AdaptiveTracker(
+            self._config(capture_buffer_size=2, capture_support_ratio=1.0)
+        )
+
+        rejected = tracker.step(0, self._candidate(0.49, 100.0))
+        self.assertEqual(rejected.mode, TrackerMode.CAPTURE)
+        self.assertFalse(rejected.candidate_accepted)
+        self.assertEqual(rejected.rejected_by, ("capture_q_min",))
+        self.assertEqual(rejected.capture_buffer_size, 0)
+
+        tracker.step(2, self._candidate(0.5, 104.0))
+        confirmed = tracker.step(4, self._candidate(0.5, 108.0))
+        self.assertEqual(confirmed.mode, TrackerMode.TRACK)
+        self.assertTrue(confirmed.capture_confirmed)
 
     def test_capture_keeps_empty_steps_without_emitting_track(self) -> None:
         tracker = AdaptiveTracker(self._config())
@@ -217,7 +234,7 @@ class AdaptiveTrackerTests(unittest.TestCase):
 
         # 在左边界附近捕获，L=2 的左侧块裁剪后应去重。
         for frame in (0, 2, 4):
-            tracker.step(frame, self._candidate(0.2, 10.0, 0.0))
+            tracker.step(frame, self._candidate(0.9, 10.0, 0.0))
         tracker.step(5, self._candidate(0.1, 10.0, 0.0))
         tracker.step(6, self._candidate(0.1, 10.0, 0.0))
         self.assertEqual(tracker.mode, TrackerMode.TRACK)

@@ -416,7 +416,7 @@ SimpleCNN
 
 上述流程对应 `global_top1` 推理基线。实际使用经过优化的 `adaptive_tracker` 推理方法：
 
-- CAPTURE/RECAPTURE 阶段对全局34块直接取 q-Top-1，并在多个历史时刻间做运动补偿与中位数支持确认
+- CAPTURE/RECAPTURE 阶段对全局34块直接取 q-Top-1，先以 `capture_q_min` 过滤候选，再在多个历史时刻间做运动补偿与中位数支持确认
 - TRACK 阶段仅推理预测位置附近的 $1/3/5$ 个块，再对该局部 batch 直接取 q-Top-1，并按 $q$ 门限、融合后的瞬时速度门限和历史平均速度门限决定是否更新状态
 
 该状态机的参数和状态转换见 `_doc/postprocess.md`

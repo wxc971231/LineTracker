@@ -107,6 +107,7 @@ class TrackerConfig:
     capture_buffer_size: int = 8
     capture_support_ratio: float = 0.7
     capture_radius_m: float = 500.0
+    capture_q_min: float = 0.5
     q_keep: float = 0.5
     instant_speed_gate_mpf: tuple[float, ...] = (17.0, 25.0, 34.0)
     average_speed_gate_mpf: tuple[float, ...] = (17.0, 25.0, 34.0)
@@ -137,6 +138,7 @@ class TrackerConfig:
         finite_fields = {
             "capture_support_ratio": self.capture_support_ratio,
             "capture_radius_m": self.capture_radius_m,
+            "capture_q_min": self.capture_q_min,
             "q_keep": self.q_keep,
             "alpha": self.alpha,
             "beta": self.beta,
@@ -153,6 +155,7 @@ class TrackerConfig:
 
         assert 0.0 < self.capture_support_ratio <= 1.0, "capture_support_ratio 必须在 (0, 1] 内。"
         assert self.capture_radius_m >= 0.0, "capture_radius_m 不能为负数。"
+        assert 0.0 <= self.capture_q_min <= 1.0, "capture_q_min 必须在 [0, 1] 内。"
         assert 0.0 <= self.q_keep <= 1.0, "q_keep 必须在 [0, 1] 内。"
         assert 0.0 <= self.alpha <= 1.0, "alpha 必须在 [0, 1] 内。"
         assert self.beta >= 0.0, "beta 不能为负数。"
@@ -423,31 +426,41 @@ class AdaptiveTracker:
     def _step_capture(self, frame_index: int, candidate: Candidate | None) -> _StepOutcome:
         """处理一次 CAPTURE 或 RECAPTURE 的全局 Top-1，并尝试确认轨迹。"""
         candidate_valid = candidate is not None and candidate.is_valid
+        candidate_accepted = False
+        rejected_by: list[str] = []
         support_count = 0
         capture_confirmed = False
         measurement_updated = False
 
-        if candidate_valid:
-            # 仅缓存数值有效的候选；缓存满后最早候选由 deque 自动弹出。
+        if not candidate_valid:
+            if candidate is not None:
+                rejected_by.append("invalid_candidate")
+        else:
             assert candidate is not None
-            self._capture_buffer.append(_TimedCandidate(frame_index, candidate))
-            estimate = self._capture_estimate(frame_index)
-            support_count = 0 if estimate is None else estimate.support_count
-            # 必须同时满足“缓存已满”和“中位位置获得足够支持”才切换 TRACK。
-            if (
-                estimate is not None
-                and len(self._capture_buffer) == self.config.capture_buffer_size
-                and estimate.support_count >= self.config.capture_min_support
-            ):
-                self._initialise_track(frame_index, estimate)   # 转入 TRACK 模式，初始化状态机
-                capture_confirmed = True
-                measurement_updated = True
+            if float(candidate.q) < self.config.capture_q_min:
+                rejected_by.append("capture_q_min")
+            else:
+                # 仅缓存通过捕获 q 门限的候选；缓存满后最早候选由 deque 自动弹出。
+                candidate_accepted = True
+                self._capture_buffer.append(_TimedCandidate(frame_index, candidate))
+                estimate = self._capture_estimate(frame_index)
+                support_count = 0 if estimate is None else estimate.support_count
+                # 必须同时满足“缓存已满”和“中位位置获得足够支持”才切换 TRACK。
+                if (
+                    estimate is not None
+                    and len(self._capture_buffer) == self.config.capture_buffer_size
+                    and estimate.support_count >= self.config.capture_min_support
+                ):
+                    self._initialise_track(frame_index, estimate)   # 转入 TRACK 模式，初始化状态机
+                    capture_confirmed = True
+                    measurement_updated = True
 
         return _StepOutcome(
-            candidate_accepted=candidate_valid,
+            candidate_accepted=candidate_accepted,
             measurement_updated=measurement_updated,
             capture_support_count=support_count,
             capture_confirmed=capture_confirmed,
+            rejected_by=tuple(rejected_by),
         )
 
     def _step_track(self, frame_index: int, candidate: Candidate | None) -> _StepOutcome:
