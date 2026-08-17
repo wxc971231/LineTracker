@@ -20,8 +20,8 @@ from infer.common.complexity import estimate_model_complexity
 from infer.common.model_loader import load_inference_bundle
 from infer.common.multi_device import (
     execute_device_tasks,
-    parse_npu_devices,
     partition_round_robin,
+    resolve_npu_devices,
 )
 from infer.common.output import configure_logger, safe_name, write_json
 from infer.common.runner import ModelRunner
@@ -109,7 +109,7 @@ def run(args: argparse.Namespace) -> Path:
     """启动每 NPU 一个 worker 的纯背景虚警评估。"""
     if args.device != "auto":
         raise ValueError("并行入口请使用 --devices 指定 NPU，不支持 --device。")
-    devices = parse_npu_devices(args.devices)
+    devices = resolve_npu_devices(args.devices)
     reference_bundle = load_inference_bundle(args.checkpoint, data_root=args.data_root, device="cpu")
     method_config = adaptive_config_from_args(args)
     method_config.validate(reference_bundle.config)
@@ -199,8 +199,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.description = "按样本将纯背景虚警评估静态分配到多个 NPU。"
     parser.add_argument(
         "--devices",
-        required=True,
-        help="逗号分隔的 NPU 编号或 npu:<编号>，例如 0,1,2,3。",
+        help="逻辑 NPU，例如 0,1,2；缺省时使用全部 ASCEND_RT_VISIBLE_DEVICES。",
     )
     return parser
 

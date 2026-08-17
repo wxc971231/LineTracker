@@ -134,22 +134,20 @@
             "subProcess": false
         },
         {
-            "name": "SimpleCNN · 多 NPU 样本并行推理 · NPU 0,1",
+            "name": "SimpleCNN · 多 NPU 样本并行推理 · 全部可见 Chip",
             "type": "debugpy",
             "request": "launch",
             "program": "${workspaceFolder}/method/SimpleCNN/infer/run_infer_parallel.py",
             "args": [
                 "--method",
-                "adaptive_tracker",
-                "--devices",
-                "0,1"
+                "adaptive_tracker"
             ],
             "cwd": "${workspaceFolder}/method/SimpleCNN",
             "envFile": "${workspaceFolder}/method/SimpleCNN/.env",
             "env": {
                 "LT_ACCELERATOR": "npu",
                 "CUDA_VISIBLE_DEVICES": "0",
-                "ASCEND_RT_VISIBLE_DEVICES": "0,1",
+                "ASCEND_RT_VISIBLE_DEVICES": "6,7,8,9,12,13",
                 "OMP_NUM_THREADS": "1",
                 "ASCEND_GLOBAL_LOG_LEVEL": "3"
             },
@@ -158,13 +156,11 @@
             "subProcess": true
         },
         {
-            "name": "SimpleCNN · 多 NPU 纯背景虚警评估 · NPU 0,1",
+            "name": "SimpleCNN · 多 NPU 纯背景虚警评估 · 全部可见 Chip",
             "type": "debugpy",
             "request": "launch",
             "program": "${workspaceFolder}/method/SimpleCNN/infer/run_FA_eval_parallel.py",
             "args": [
-                "--devices",
-                "0,1",
                 "--no-warmup"
             ],
             "cwd": "${workspaceFolder}/method/SimpleCNN",
@@ -172,7 +168,7 @@
             "env": {
                 "LT_ACCELERATOR": "npu",
                 "CUDA_VISIBLE_DEVICES": "0",
-                "ASCEND_RT_VISIBLE_DEVICES": "0,1",
+                "ASCEND_RT_VISIBLE_DEVICES": "6,7,8,9,12,13",
                 "OMP_NUM_THREADS": "1",
                 "ASCEND_GLOBAL_LOG_LEVEL": "3"
             },

@@ -2,11 +2,10 @@
 
 from __future__ import annotations
 
-from contextlib import redirect_stderr
-from io import StringIO
 import sys
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 
 METHOD_ROOT = Path(__file__).resolve().parents[1]
@@ -17,6 +16,7 @@ from infer.common.multi_device import (  # noqa: E402
     execute_device_tasks,
     parse_npu_devices,
     partition_round_robin,
+    resolve_npu_devices,
 )
 from infer.run_FA_eval_parallel import build_parser as build_fa_parallel_parser  # noqa: E402
 from infer.run_infer_parallel import build_parser as build_infer_parallel_parser  # noqa: E402
@@ -46,6 +46,13 @@ class MultiDeviceTests(unittest.TestCase):
             "npu:2": ("sample_2",),
         })
 
+    @patch.dict("os.environ", {"ASCEND_RT_VISIBLE_DEVICES": "6,7,8"}, clear=True)
+    def test_resolve_npu_devices_uses_all_visible_devices(self) -> None:
+        self.assertEqual(
+            resolve_npu_devices(None),
+            ("npu:0", "npu:1", "npu:2"),
+        )
+
     def test_execute_device_tasks_returns_results_by_device(self) -> None:
         results = execute_device_tasks(
             {
@@ -56,11 +63,9 @@ class MultiDeviceTests(unittest.TestCase):
         )
         self.assertEqual(results, {"npu:0": ("npu:0", 3), "npu:1": ("npu:1", 5)})
 
-    def test_parallel_entry_parsers_require_explicit_npu_devices(self) -> None:
+    def test_parallel_entry_parsers_accept_optional_npu_devices(self) -> None:
         for parser in (build_infer_parallel_parser(), build_fa_parallel_parser()):
-            with redirect_stderr(StringIO()):
-                with self.assertRaises(SystemExit):
-                    parser.parse_args([])
+            self.assertIsNone(parser.parse_args([]).devices)
             args = parser.parse_args(["--devices", "0,npu:2"])
             self.assertEqual(args.devices, "0,npu:2")
 

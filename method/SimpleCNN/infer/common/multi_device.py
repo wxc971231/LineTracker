@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from concurrent.futures import ProcessPoolExecutor, as_completed
+import os
 import re
 from collections.abc import Sequence
 from multiprocessing import get_context
@@ -29,6 +30,20 @@ def parse_npu_devices(raw: str) -> tuple[str, ...]:
     if not devices:
         raise ValueError("--devices 至少需要指定一个 NPU。")
     return tuple(devices)
+
+
+def resolve_npu_devices(raw: str | None) -> tuple[str, ...]:
+    """解析显式设备；未指定时使用全部可见的 Ascend NPU。"""
+    if raw is not None:
+        return parse_npu_devices(raw)
+
+    visible_devices = os.environ.get("ASCEND_RT_VISIBLE_DEVICES", "").strip()
+    if not visible_devices:
+        raise ValueError(
+            "请通过 --devices 指定 NPU，或设置 ASCEND_RT_VISIBLE_DEVICES。"
+        )
+    physical_devices = parse_npu_devices(visible_devices)
+    return tuple(f"npu:{index}" for index in range(len(physical_devices)))
 
 
 def partition_round_robin(items: Sequence[T], devices: Sequence[str]) -> dict[str, tuple[T, ...]]:
