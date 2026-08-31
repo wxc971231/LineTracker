@@ -7,12 +7,12 @@
 可直接调用::
 
     build_comparison([
-        (Path("/path/to/run_a"), "adaptive_tracker_stride5"),
+        (Path("/path/to/run_a"), "adaptive_tracker_stride5_captureq0.5_trackq0.5"),
         (Path("/path/to/run_b"), "global_top1_stride5"),
     ])
 
-也可在命令行重复传入 ``--item <run_dir> <method_dir>``。当没有命令行 ``--item``
-时，``DEFAULT_COMPARISON_INPUTS`` 中的列表会被使用，便于在服务器上直接编辑运行。
+也可在命令行重复传入 ``--item <run_dir> <method_dir>``。当没有命令行 ``--item`` 时，
+``DEFAULT_COMPARISON_INPUTS`` 中的列表会被使用，便于在服务器上直接编辑运行。
 """
 
 from __future__ import annotations
@@ -49,7 +49,7 @@ def _entry_name(run_dir: Path, method_dir: str) -> str:
 
 
 def _normalise_items(items: Sequence[ComparisonItem]) -> list[tuple[Path, str]]:
-    """校验并规范化 ``[(run_dir, method_dir), ...]`` 输入列表。"""
+    """校验并规范化 ``[(run_dir, method_dir)]`` 输入列表。"""
     if not items:
         raise ValueError("至少需要提供一个 (run_dir, method_dir) 比较项。")
 
@@ -59,7 +59,6 @@ def _normalise_items(items: Sequence[ComparisonItem]) -> list[tuple[Path, str]]:
         run_dir = Path(raw_run_dir).expanduser().resolve()
         if not isinstance(method_dir, str) or not method_dir:
             raise ValueError(f"method_dir 必须是非空字符串，实际为 {method_dir!r}")
-        # 复用单方案脚本的方法目录契约，尽早指出配置错误。
         summary_single._parse_method_directory(method_dir)
         key = (run_dir, method_dir)
         if key in seen:
@@ -409,8 +408,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="对比多个 schema v5 SimpleCNN 推理结果的轨迹质量")
     parser.add_argument(
         "--item",
-        nargs=2,
         action="append",
+        nargs=2,
         metavar=("RUN_DIR", "METHOD_DIR"),
         help="重复传入：--item <run_dir> <method_dir>；未传入时使用 DEFAULT_COMPARISON_INPUTS",
     )
@@ -430,7 +429,9 @@ def main() -> None:
         items = [
             (Path('/mnt/host-model/weixc/code/LineTracker/method/SimpleCNN/infer/_output/F300-N10k-S42--v2-s-best-s48000'), 'adaptive_tracker_stride5'),
             (Path('/mnt/host-model/weixc/code/LineTracker/method/SimpleCNN/infer/_output/F300-N10k-S42--v2-n-best-s42000'), 'adaptive_tracker_stride5'),
-            (Path('/mnt/host-model/weixc/code/LineTracker/method/SimpleCNN/infer/_output/F300-N10k-S42--v2-xn-best-s18000'), 'adaptive_tracker_stride5'),   
+            (Path('/mnt/host-model/weixc/code/LineTracker/method/SimpleCNN/infer/_output/F300-N10k-S42--v2-xn-best-s18000'), 'adaptive_tracker_stride5'), 
+            (Path('/mnt/host-model/weixc/code/LineTracker/method/SimpleCNN/infer/_output/F300-N10k-S42--v2-n-best-s42000'), 'adaptive_tracker_stride5_captureq0.5_trackq0.5'),
+            (Path('/mnt/host-model/weixc/code/LineTracker/method/SimpleCNN/infer/_output/F300-N10k-S42--v2-s-best-s48000'), 'adaptive_tracker_stride5_captureq0.5_trackq0.5'),     
         ]
 
 

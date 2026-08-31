@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+import logging
 import sys
 import unittest
 from pathlib import Path
@@ -23,12 +25,16 @@ from infer.run_infer import (
     _adaptive_summary,
     _compact_step_log,
     _frame_timing_records,
+    _method_output_directory_name,
     _sample_compute_summary,
+    _write_sample,
     _trajectory_summary,
     _select_records,
     _static_model_complexity,
     build_parser,
 )
+from infer.adaptive_tracker.infer import AdaptiveInferenceConfig
+from infer.global_top1.infer import GlobalTop1Config
 
 
 class InferEntryTests(unittest.TestCase):
@@ -95,6 +101,43 @@ class InferEntryTests(unittest.TestCase):
         )
         self.assertEqual(data_tag, "F300-N10k-S42")
         self.assertEqual(checkpoint_tag(checkpoint, 41980), "v2-xn-best-s41980")
+
+    def test_method_output_directory_name_is_executor_independent(self) -> None:
+        self.assertEqual(
+            _method_output_directory_name(
+                AdaptiveInferenceConfig(time_stride=5, capture_q_min=0.0, q_keep=0.5)
+            ),
+            "adaptive_tracker_stride5_captureq0_trackq0.5",
+        )
+        self.assertEqual(
+            _method_output_directory_name(GlobalTop1Config(time_stride=5)),
+            "global_top1_stride5",
+        )
+
+    def test_sample_metrics_record_the_full_parameter_method_directory(self) -> None:
+        with TemporaryDirectory() as temporary:
+            method_dir = Path(temporary) / "adaptive_tracker_stride5_captureq0.5_trackq0.5"
+            method_dir.mkdir()
+            source: Any = SimpleNamespace(record=SimpleNamespace(source_id="dataset1_synthetic_0000"))
+            result = {"steps": []}
+            _write_sample(
+                method_dir,
+                method="adaptive_tracker",
+                result=result,
+                source=source,
+                trajectory={},
+                compute={},
+                timing={},
+                tracker={},
+                save_figures=False,
+                figure_dpi=100,
+                config=SimpleNamespace(),
+                time_stride=5,
+                title="test",
+                logger=logging.getLogger(__name__),
+            )
+            payload = json.loads((method_dir / "metrics.json").read_text(encoding="utf-8"))
+        self.assertEqual(payload["method_dir"], method_dir.name)
 
     def test_json_conversion_turns_nonfinite_scalars_and_arrays_into_null(self) -> None:
         value = to_jsonable(

@@ -19,7 +19,10 @@ if str(METHOD_ROOT) not in sys.path:
     sys.path.insert(0, str(METHOD_ROOT))
 
 from data.dataloader import PackedSource, standard_distance_starts
-from infer.adaptive_tracker.infer import run_source as run_adaptive_source
+from infer.adaptive_tracker.infer import (
+    AdaptiveInferenceConfig,
+    run_source as run_adaptive_source,
+)
 from infer.common.complexity import estimate_model_complexity
 from infer.common.model_loader import load_inference_bundle
 from infer.common.output import configure_logger, create_output_dir, safe_name, write_json
@@ -27,6 +30,7 @@ from infer.common.plotting import plot_false_alarm_diagnostic
 from infer.common.runner import ModelRunner
 from infer.run_infer import (
     _checkpoint_step,
+    _method_output_directory_name,
     _nonnegative_int,
     _positive_int,
     _sample_compute_summary,
@@ -290,16 +294,19 @@ def _assert_pure_background(source: PackedSource) -> None:
         )
 
 
-def _output_dir(*, data_root: Path, checkpoint_path: Path, checkpoint_step: object, args: argparse.Namespace) -> Path:
+def _output_dir(
+    *,
+    data_root: Path,
+    checkpoint_path: Path,
+    checkpoint_step: object,
+    method_config: AdaptiveInferenceConfig,
+) -> Path:
     base_dir = create_output_dir(
         data_root=data_root,
         checkpoint_path=checkpoint_path,
         checkpoint_step=checkpoint_step,
     )
-    name = safe_name(
-        f"adaptive_tracker_stride{args.time_stride}_captureq{args.capture_q_min:g}_trackq{args.q_keep:g}"
-    )
-    path = base_dir / "false_alarm" / name
+    path = base_dir / "false_alarm" / _method_output_directory_name(method_config)
     (path / "samples").mkdir(parents=True, exist_ok=True)
     return path
 
@@ -387,7 +394,7 @@ def run(args: argparse.Namespace) -> Path:
         data_root=bundle.config.data_root,
         checkpoint_path=bundle.checkpoint_path,
         checkpoint_step=checkpoint_step,
-        args=args,
+        method_config=method_config,
     )
     write_json(
         output_dir / "config.json",

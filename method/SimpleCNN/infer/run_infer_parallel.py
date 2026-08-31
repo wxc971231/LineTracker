@@ -23,7 +23,7 @@ from infer.common.multi_device import (
     partition_round_robin,
     resolve_npu_devices,
 )
-from infer.common.output import configure_logger, create_output_dir, safe_name, write_json
+from infer.common.output import configure_logger, write_json
 from infer.common.runner import ModelRunner
 from infer.global_top1.infer import GlobalTop1Config, run_source as run_global_source
 from infer.run_infer import (
@@ -33,8 +33,10 @@ from infer.run_infer import (
     _compact_trajectory_summary,
     _effective_sample_bounds,
     _figure_title,
+    _inference_output_dir,
     _method_config,
     _method_directory,
+    _method_output_directory_name,
     _sample_compute_summary,
     _sample_directory,
     _select_records,
@@ -47,13 +49,6 @@ from infer.run_infer import (
     build_parser as build_single_parser,
 )
 from utils.process_title import set_process_title
-
-
-def _parallel_output_dir(base_dir: Path, devices: Sequence[str]) -> Path:
-    tag = safe_name("-".join(device.replace(":", "") for device in devices))
-    output_dir = base_dir / f"parallel-{tag}"
-    (output_dir / "samples").mkdir(parents=True, exist_ok=True)
-    return output_dir
 
 
 def _run_device_worker(task: Mapping[str, Any]) -> dict[str, object]:
@@ -115,7 +110,10 @@ def _run_device_worker(task: Mapping[str, Any]) -> dict[str, object]:
         if args.method == "adaptive_tracker":
             tracker = _adaptive_summary(result, frames_per_window=bundle.config.frames_per_window)
         sample_dir = _sample_directory(output_dir, record.source_id)
-        method_dir = _method_directory(sample_dir, args.method, args.time_stride)
+        method_dir = _method_directory(
+            sample_dir,
+            _method_output_directory_name(method_config),
+        )
         _write_sample(
             method_dir,
             method=args.method,
@@ -160,12 +158,11 @@ def run(args: argparse.Namespace) -> Path:
         input_width=reference_bundle.config.block_width_m // reference_bundle.config.input_channels,
     )
     checkpoint_step = _checkpoint_step(reference_bundle.checkpoint)
-    base_dir = create_output_dir(
+    output_dir = _inference_output_dir(
         data_root=reference_bundle.config.data_root,
         checkpoint_path=reference_bundle.checkpoint_path,
         checkpoint_step=checkpoint_step,
     )
-    output_dir = _parallel_output_dir(base_dir, devices)
     write_json(
         output_dir / "_infer_config.json",
         {
@@ -228,6 +225,13 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+
+    args.checkpoint = Path('/mnt/host-model/weixc/code/LineTracker/method/SimpleCNN/runs/simplecnn_v2/limit50k-gbs1024-lr5e-4-pos25-vs5-models-cfg11ba6304/20260728_113116/checkpoints/best.pt')
+    args.method = 'adaptive_tracker'
+    args.time_stride = 5
+    args.samples_start = 0
+    args.samples_stop = 5000
+
     try:
         run(args)
     except KeyboardInterrupt:

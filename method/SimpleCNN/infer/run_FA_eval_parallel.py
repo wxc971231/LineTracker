@@ -16,6 +16,7 @@ if str(METHOD_ROOT) not in sys.path:
     sys.path.insert(0, str(METHOD_ROOT))
 
 from data.dataloader import PackedSource, SourceRecord, standard_distance_starts
+from infer.adaptive_tracker.infer import AdaptiveInferenceConfig
 from infer.common.complexity import estimate_model_complexity
 from infer.common.model_loader import load_inference_bundle
 from infer.common.multi_device import (
@@ -23,7 +24,7 @@ from infer.common.multi_device import (
     partition_round_robin,
     resolve_npu_devices,
 )
-from infer.common.output import configure_logger, safe_name, write_json
+from infer.common.output import configure_logger, write_json
 from infer.common.runner import ModelRunner
 from infer.run_FA_eval import (
     FalseAlarmSummary,
@@ -42,13 +43,6 @@ from infer.run_infer import (
 from utils.process_title import set_process_title
 
 
-def _parallel_output_dir(base_dir: Path, devices: Sequence[str]) -> Path:
-    tag = safe_name("-".join(device.replace(":", "") for device in devices))
-    output_dir = base_dir / f"parallel-{tag}"
-    (output_dir / "samples").mkdir(parents=True, exist_ok=True)
-    return output_dir
-
-
 def _run_device_worker(task: Mapping[str, Any]) -> dict[str, object]:
     """在指定 NPU 上顺序完成其分配到的纯背景样本。"""
     args = task["args"]
@@ -63,7 +57,7 @@ def _run_device_worker(task: Mapping[str, Any]) -> dict[str, object]:
     worker_start = perf_counter()
     set_process_title("false-alarm-parallel", label=device, infer_rank=False)
     bundle = load_inference_bundle(args.checkpoint, data_root=args.data_root, device=device)
-    method_config = adaptive_config_from_args(args)
+    method_config: AdaptiveInferenceConfig = adaptive_config_from_args(args)
     tracker_config = method_config.validate(bundle.config)
     complexity = estimate_model_complexity(
         bundle.model,
@@ -96,7 +90,13 @@ def _run_device_worker(task: Mapping[str, Any]) -> dict[str, object]:
             logger=logger,
         )
         summaries.append(summary)
-        logger.info("device=%s source=%s FAR=%.3f%%", device, record.source_id, 100.0 * summary["false_alarm_frame_rate"])
+        logger.info(
+            "device=%s source=%s FAR=%.3f%% (含外推 %.3f%%)",
+            device,
+            record.source_id,
+            100.0 * float(summary["false_alarm_frame_rate"]),
+            100.0 * float(summary["false_alarm_frame_rate_including_unreliable"]),
+        )
     return {
         "device": device,
         "sample_count": len(records),
@@ -111,7 +111,7 @@ def run(args: argparse.Namespace) -> Path:
         raise ValueError("并行入口请使用 --devices 指定 NPU，不支持 --device。")
     devices = resolve_npu_devices(args.devices)
     reference_bundle = load_inference_bundle(args.checkpoint, data_root=args.data_root, device="cpu")
-    method_config = adaptive_config_from_args(args)
+    method_config: AdaptiveInferenceConfig = adaptive_config_from_args(args)
     method_config.validate(reference_bundle.config)
     records = _select_records(reference_bundle, args)
     complexity = estimate_model_complexity(
@@ -121,13 +121,12 @@ def run(args: argparse.Namespace) -> Path:
         input_width=reference_bundle.config.block_width_m // reference_bundle.config.input_channels,
     )
     checkpoint_step = _checkpoint_step(reference_bundle.checkpoint)
-    base_dir = _output_dir(
+    output_dir = _output_dir(
         data_root=reference_bundle.config.data_root,
         checkpoint_path=reference_bundle.checkpoint_path,
         checkpoint_step=checkpoint_step,
-        args=args,
+        method_config=method_config,
     )
-    output_dir = _parallel_output_dir(base_dir, devices)
     write_json(
         output_dir / "config.json",
         {

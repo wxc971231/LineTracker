@@ -123,6 +123,34 @@ def _sample_file_stem(method: str, time_stride: int) -> str:
     return f"{safe_name(method)}_stride{time_stride}"
 
 
+def _method_output_directory_name(
+    method_config: GlobalTop1Config | AdaptiveInferenceConfig,
+) -> str:
+    """返回与执行设备无关的推理参数目录名。"""
+    if isinstance(method_config, GlobalTop1Config):
+        return _sample_file_stem("global_top1", method_config.time_stride)
+    return safe_name(
+        "adaptive_tracker_"
+        f"stride{method_config.time_stride}_"
+        f"captureq{method_config.capture_q_min:g}_"
+        f"trackq{method_config.q_keep:g}"
+    )
+
+
+def _inference_output_dir(
+    *,
+    data_root: Path,
+    checkpoint_path: Path,
+    checkpoint_step: int | str | None,
+) -> Path:
+    """创建所有推理方法共享的 checkpoint 输出根目录。"""
+    return create_output_dir(
+        data_root=data_root,
+        checkpoint_path=checkpoint_path,
+        checkpoint_step=checkpoint_step,
+    )
+
+
 def _effective_sample_bounds(args: argparse.Namespace) -> tuple[int, int | None]:
     """兼容现有启动入口，返回本次实际用于切片的样本编号范围。"""
     sample_start = getattr(args, "sample_start", None)
@@ -208,7 +236,7 @@ def _write_method_parameter_snapshot(
     effective_device: str | None = None,
 ) -> Path:
     """按方法目录名保存本次实际推理参数，供离线汇总报告复现使用。"""
-    method_dir = _sample_file_stem(args.method, args.time_stride)
+    method_dir = _method_output_directory_name(method_config)
     payload: dict[str, Any] = {
         "schema_version": 1,
         "method_dir": method_dir,
@@ -429,8 +457,8 @@ def _sample_directory(output_dir: Path, source_id: str) -> Path:
     return path
 
 
-def _method_directory(sample_dir: Path, method: str, time_stride: int) -> Path:
-    path = sample_dir / _sample_file_stem(method, time_stride)
+def _method_directory(sample_dir: Path, method_dir: str) -> Path:
+    path = sample_dir / method_dir
     path.mkdir(exist_ok=True)
     return path
 
@@ -478,6 +506,7 @@ def _write_sample(
         "schema_version": 5,
         "source_id": source.record.source_id,
         "method": method,
+        "method_dir": method_dir.name,
         "time_stride": time_stride,
         "trajectory": trajectory,
         "compute": compute,
@@ -519,7 +548,7 @@ def run(args: argparse.Namespace) -> Path:
 
     # 保存推理方法无关的数据/模型配置
     checkpoint_step = _checkpoint_step(bundle.checkpoint)
-    output_dir = create_output_dir(
+    output_dir = _inference_output_dir(
         data_root=bundle.config.data_root,
         checkpoint_path=bundle.checkpoint_path,
         checkpoint_step=checkpoint_step,
@@ -545,6 +574,7 @@ def run(args: argparse.Namespace) -> Path:
         method_config=method_config,
         complexity=complexity,
     )
+    method_dir_name = _method_output_directory_name(method_config)
 
     # 加载评估数据和推理执行器
     selected_records = _select_records(bundle, args)
@@ -591,7 +621,7 @@ def run(args: argparse.Namespace) -> Path:
 
         # 每个样本独立落盘，包含精简日志、指标、预测数组和可选诊断图；
         sample_dir = _sample_directory(output_dir, record.source_id)
-        method_dir = _method_directory(sample_dir, args.method, args.time_stride)
+        method_dir = _method_directory(sample_dir, method_dir_name)
         _write_sample(
             method_dir,
             method=args.method,

@@ -147,7 +147,7 @@
             "env": {
                 "LT_ACCELERATOR": "npu",
                 "CUDA_VISIBLE_DEVICES": "0",
-                "ASCEND_RT_VISIBLE_DEVICES": "6,7,8,9,12,13",
+                "ASCEND_RT_VISIBLE_DEVICES": "2,3,12,13,14,15",
                 "OMP_NUM_THREADS": "1",
                 "ASCEND_GLOBAL_LOG_LEVEL": "3"
             },
@@ -168,13 +168,13 @@
             "env": {
                 "LT_ACCELERATOR": "npu",
                 "CUDA_VISIBLE_DEVICES": "0",
-                "ASCEND_RT_VISIBLE_DEVICES": "6,7,8,9,12,13",
+                "ASCEND_RT_VISIBLE_DEVICES": "2,3,6,7,8,9,12,13",
                 "OMP_NUM_THREADS": "1",
                 "ASCEND_GLOBAL_LOG_LEVEL": "3"
             },
             "console": "integratedTerminal",
             "justMyCode": false,
-            "subProcess": true
+            "subProcess": false
         }
     ]
 }

@@ -2,6 +2,9 @@
 
 输入布局固定为：
 ``<run-dir>/samples/<source-id>/<method-dir>/metrics.json``
+
+``<method-dir>`` 在原有 ``<method>_stride<stride>`` 后附加捕获与跟踪 q 门限，
+例如 ``adaptive_tracker_stride5_captureq0.5_trackq0.5``。
 本脚本仅接受 ``schema_version == 5``，避免把旧版 v3 的计时字段与稳定版
 adaptive_tracker 的逐逻辑步计时混合统计
 """
@@ -22,7 +25,9 @@ from typing import Any, cast
 
 SCHEMA_VERSION = 5
 _SOURCE_INDEX = re.compile(r"(\d+)$")
-_METHOD_DIRECTORY = re.compile(r"(?P<method>.+)_stride(?P<stride>\d+)$")
+_METHOD_DIRECTORY = re.compile(
+    r"(?P<method>.+)_stride(?P<stride>\d+)(?:_captureq[^_]+_trackq[^_]+)?$"
+)
 
 _TRAJECTORY_FIELDS = (
     "coverage",
@@ -154,11 +159,12 @@ def _source_index(source_id: str) -> int:
 
 
 def _parse_method_directory(method_dir: str) -> tuple[str, int]:
-    """将 ``adaptive_tracker_stride5`` 校验并解析为方法名和时间步进"""
+    """校验带可选 q 门限后缀的方法目录并解析方法名、时间步进。"""
     match = _METHOD_DIRECTORY.fullmatch(method_dir)
     if match is None:
         raise ValueError(
-            "--method-dir 必须采用 <method>_stride<正整数> 形式，例如 adaptive_tracker_stride5"
+            "--method-dir 必须采用 <method>_stride<正整数>[_captureq..._trackq...] 形式，"
+            "例如 adaptive_tracker_stride5_captureq0.5_trackq0.5"
         )
     stride = int(match.group("stride"))
     if stride < 1:
@@ -744,8 +750,17 @@ def _atomic_text(path: Path, content: str) -> None:
 def build_parser() -> argparse.ArgumentParser:
     """定义 schema v5 汇总器的命令行参数"""
     parser = argparse.ArgumentParser(description="汇总 schema v5 SimpleCNN 推理输出")
-    parser.add_argument("--run-dir", type=Path, default=None, help="推理 run 根目录，例如 .../F300-N10k-S42--v2-n-best-s42000")
-    parser.add_argument("--method-dir", default=None, help="样本子目录名，例如 adaptive_tracker_stride5")
+    parser.add_argument(
+        "--run-dir",
+        type=Path,
+        default=None,
+        help="推理 run 根目录，例如 .../F300-N10k-S42--v2-n-best-s42000",
+    )
+    parser.add_argument(
+        "--method-dir",
+        default=None,
+        help="样本方法目录，例如 adaptive_tracker_stride5_captureq0.5_trackq0.5",
+    )
     parser.add_argument("--sample-start", type=_nonnegative_int, default=None, help="可选：仅纳入编号不小于该值的样本")
     parser.add_argument("--sample-stop", type=_nonnegative_int, default=None, help="可选：仅纳入编号不大于该值的样本")
     parser.add_argument("--output-dir", type=Path, default=None, help="可选：汇总输出目录；默认写入 <run-dir>/summary/")
@@ -757,7 +772,7 @@ def main() -> None:
     args = build_parser().parse_args()
 
     args.run_dir = Path('/mnt/host-model/weixc/code/LineTracker/method/SimpleCNN/infer/_output/F300-N10k-S42--v2-s-best-s48000')
-    args.method_dir = 'adaptive_tracker_stride5'
+    args.method_dir = 'adaptive_tracker_stride5_captureq0.5_trackq0.5'
 
     summary, samples, missing_indices, invalid_samples = build_summary(
         args.run_dir,
@@ -766,7 +781,8 @@ def main() -> None:
         sample_stop=args.sample_stop,
     )
     indices = [int(sample["source_index"]) for sample in samples]
-    default_name = f"{args.method_dir}_samples{min(indices):04d}-{max(indices):04d}"
+    method_dir = str(summary["input"]["method_dir"])
+    default_name = f"{method_dir}_samples{min(indices):04d}-{max(indices):04d}"
     output_dir = args.output_dir or args.run_dir / "summary" / default_name
     _atomic_json(output_dir / "summary.json", summary)
     _atomic_csv(output_dir / "per_sample.csv", samples)
@@ -774,7 +790,7 @@ def main() -> None:
     _atomic_text(output_dir / "report.md", _build_report(summary, samples))
     print(f"已汇总 {len(samples)} 个通过校验的 schema v5 样本 -> {output_dir}")
     if missing_indices:
-        print(f"警告：缺少 {args.method_dir} metrics 的样本编号：{missing_indices}")
+        print(f"警告：缺少 {method_dir} metrics 的样本编号：{missing_indices}")
     if invalid_samples:
         print(f"警告：跳过 {len(invalid_samples)} 个 metrics 校验失败样本；详见 {output_dir / 'invalid_samples.csv'}")
 
