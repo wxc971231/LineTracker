@@ -68,6 +68,18 @@ def _normalise_items(items: Sequence[ComparisonItem]) -> list[tuple[Path, str]]:
     return normalised
 
 
+def _comparison_output_directory(
+    output_dir: Path | str,
+    items: Sequence[ComparisonItem],
+) -> Path:
+    """按输入 run 目录组织 CLI 默认输出，避免不同数据集的报告混在一起。"""
+    normalised_items = _normalise_items(items)
+    run_names = {run_dir.name for run_dir, _ in normalised_items}
+    if len(run_names) == 1:
+        return Path(output_dir) / next(iter(run_names))
+    return Path(output_dir) / "multiple_runs"
+
+
 def _stats(samples: Sequence[Mapping[str, Any]], field: str) -> dict[str, float | int | None]:
     """按单方案脚本完全相同的统计定义重算某个共同样本指标。"""
     return summary_single._stats(float(sample[field]) for sample in samples)
@@ -435,15 +447,16 @@ def main() -> None:
         ]
 
 
+    destination = _comparison_output_directory(args.output_dir, items)
     comparison = write_comparison(
         items,
-        args.output_dir,
+        destination,
         sample_start=args.sample_start,
         sample_stop=args.sample_stop,
     )
     print(
         f"已生成 {len(comparison['comparisons'])} 个方案、"
-        f"{comparison['common_sample_count']} 个共同有效样本的质量对比 -> {args.output_dir}"
+        f"{comparison['common_sample_count']} 个共同有效样本的质量对比 -> {destination}"
     )
 
 

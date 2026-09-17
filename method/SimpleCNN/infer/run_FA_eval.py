@@ -82,6 +82,22 @@ class FalseAlarmSummary(TypedDict):
     false_alarm_event_duration_max_s_including_unreliable: float
 
 
+def _aggregate_count(summary: Mapping[str, object], field: str) -> int:
+    """读取聚合所需的计数字段，并在输入结构损坏时给出明确错误。"""
+    value = summary[field]
+    if not isinstance(value, (int, float)):
+        raise TypeError(f"{field} 必须是数值计数，实际为 {type(value).__name__}。")
+    return int(value)
+
+
+def _aggregate_durations(summary: Mapping[str, object], field: str) -> list[int]:
+    """读取聚合所需的连续虚警时长列表。"""
+    value = summary[field]
+    if not isinstance(value, list) or not all(isinstance(duration, int) for duration in value):
+        raise TypeError(f"{field} 必须是整数列表。")
+    return value
+
+
 def _one_dimensional(values: object, name: str, *, frames: int, dtype: Any) -> np.ndarray:
     array = np.asarray(values, dtype=dtype)
     if array.ndim != 1 or array.size != frames:
@@ -191,26 +207,30 @@ def _source_false_alarm_summary(
 
 
 def _aggregate_false_alarm_summaries(
-    summaries: Sequence[FalseAlarmSummary],
+    summaries: Sequence[FalseAlarmSummary] | Sequence[Mapping[str, object]],
     *,
     frame_interval_s: float,
 ) -> dict[str, float | int]:
     """将逐样本虚警统计聚合为总体帧级与样本级比率。"""
     if not math.isfinite(frame_interval_s) or frame_interval_s <= 0.0:
         raise ValueError("frame_interval_s 必须为正有限数。")
-    evaluable_frames = sum(int(summary["evaluable_frames"]) for summary in summaries)
-    false_alarm_frames = sum(int(summary["false_alarm_frames"]) for summary in summaries)
+    evaluable_frames = sum(_aggregate_count(summary, "evaluable_frames") for summary in summaries)
+    false_alarm_frames = sum(_aggregate_count(summary, "false_alarm_frames") for summary in summaries)
     false_alarm_frames_including_unreliable = sum(
-        int(summary["false_alarm_frames_including_unreliable"])
+        _aggregate_count(summary, "false_alarm_frames_including_unreliable")
         for summary in summaries
     )
-    reliable_frames = sum(int(summary["reliable_false_alarm_frames"]) for summary in summaries)
-    unreliable_frames = sum(int(summary["unreliable_false_alarm_frames"]) for summary in summaries)
+    reliable_frames = sum(
+        _aggregate_count(summary, "reliable_false_alarm_frames") for summary in summaries
+    )
+    unreliable_frames = sum(
+        _aggregate_count(summary, "unreliable_false_alarm_frames") for summary in summaries
+    )
     durations = np.asarray(
         [
             duration
             for summary in summaries
-            for duration in summary["false_alarm_event_durations_frames"]
+            for duration in _aggregate_durations(summary, "false_alarm_event_durations_frames")
         ],
         dtype=np.float64,
     )
@@ -218,13 +238,17 @@ def _aggregate_false_alarm_summaries(
         [
             duration
             for summary in summaries
-            for duration in summary["false_alarm_event_durations_frames_including_unreliable"]
+            for duration in _aggregate_durations(
+                summary, "false_alarm_event_durations_frames_including_unreliable"
+            )
         ],
         dtype=np.float64,
     )
-    samples_with_false_alarm = sum(int(summary["false_alarm_frames"]) > 0 for summary in summaries)
+    samples_with_false_alarm = sum(
+        _aggregate_count(summary, "false_alarm_frames") > 0 for summary in summaries
+    )
     samples_with_false_alarm_including_unreliable = sum(
-        int(summary["false_alarm_frames_including_unreliable"]) > 0
+        _aggregate_count(summary, "false_alarm_frames_including_unreliable") > 0
         for summary in summaries
     )
     sample_count = len(summaries)
@@ -286,7 +310,7 @@ def _aggregate_false_alarm_summaries(
     }
 
 
-def _assert_pure_background(source: PackedSource) -> None:
+def _assert_pure_background(source: Any) -> None:
     """拒绝含有任意实际目标响应的样本，防止误用有目标数据集。"""
     if np.any(source.target_hit):
         raise ValueError(

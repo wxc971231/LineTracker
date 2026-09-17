@@ -107,7 +107,7 @@ def _checkpoint_step(checkpoint: Mapping[str, Any]) -> int | str | None:
         return str(value)
 
 
-def _select_records(bundle: InferenceBundle, args: argparse.Namespace) -> list[SourceRecord]:
+def _select_records(bundle: InferenceBundle, args: object) -> list[SourceRecord]:
     """稳定选取 data_root 按 source_id 排序后的前 N 个一级样本目录。"""
     records = sorted(discover_sources(bundle.config.data_root), key=lambda record: record.source_id)
     sample_start, sample_stop = _effective_sample_bounds(args)
@@ -151,7 +151,7 @@ def _inference_output_dir(
     )
 
 
-def _effective_sample_bounds(args: argparse.Namespace) -> tuple[int, int | None]:
+def _effective_sample_bounds(args: object) -> tuple[int, int | None]:
     """兼容现有启动入口，返回本次实际用于切片的样本编号范围。"""
     sample_start = getattr(args, "sample_start", None)
     sample_stop = getattr(args, "sample_stop", None)
@@ -475,7 +475,7 @@ def _write_sample(
     tracker: Mapping[str, Any],
     save_figures: bool,
     figure_dpi: int,
-    config: SimpleCNNConfig,
+    config: object,
     time_stride: int,
     title: str,
     logger: logging.Logger,
@@ -485,6 +485,8 @@ def _write_sample(
     write_jsonl(method_dir / "log.jsonl", _compact_step_log(method, steps))
     figure_error: str | None = None
     if save_figures:
+        if not isinstance(config, SimpleCNNConfig):
+            raise TypeError("save_figures=True 时 config 必须是 SimpleCNNConfig。")
         try:
             figure = plot_source_diagnostic(
                 source,
