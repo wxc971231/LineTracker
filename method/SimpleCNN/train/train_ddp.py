@@ -83,8 +83,8 @@ if __name__ == "__main__":
     """准备 DDP、固定数据清单、W&B 并启动按 step 的训练。"""
 
     args = parse_entrypoint_args(
-        config="simplecnn_v1",      # configs 下的 profile 名称
-        resume="/mnt/host-model/weixc/code/LineTracker/method/SimpleCNN/runs/simplecnn_v2/limit50k-gbs1024-lr5e-4-pos25-vs5-models-cfg11ba6304/20260728_113116/checkpoints/last.pt",
+        config="simplecnn_v2",      # configs 下的 profile 名称
+        resume=None,                # 默认从头训练；恢复训练时显式传 --resume /path/to/last.pt。
         overrides=(),               # 需要覆盖的参数字段，如 ("batch_size_per_gpu=16",)。
     )
     # 在 HCCL/NCCL 初始化前命名，使初始化失败的 rank 也能被准确识别。

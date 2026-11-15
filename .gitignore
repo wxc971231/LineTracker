@@ -223,3 +223,9 @@ data/raw/dataset260707
 data/synthetic/gen
 method/SimpleCNN/**/kernel_meta/
 method/SimpleCNN/infer/_output
+
+# Track the shared SimpleCNN runtime configuration.
+!/method/SimpleCNN/.env
+
+# Ascend CANN generated fusion statistics.
+/method/SimpleCNN/fusion_result.json

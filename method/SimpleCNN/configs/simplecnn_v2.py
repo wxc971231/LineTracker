@@ -9,7 +9,7 @@ def get_config() -> SimpleCNNConfig:
     """以 20260726 的 50k/model-n 实验为对照，只引入 v2 必要变化。"""
     return SimpleCNNConfig(
         # 实验与数据划分；data_root/output_root 继续由 .env 按机器覆盖。
-        run_name="simplecnn_v2",
+        run_name="simplecnn_v2", # pyright: ignore[reportCallIssue]
         seed=42,
         split_seed=42,
         source_sample_limit=50_000,
@@ -47,7 +47,7 @@ def get_config() -> SimpleCNNConfig:
         validation_time_stride=5,
 
         # 保持 model-n 容量，便于与旧实验做可解释对照。
-        model_type="s",
+        model_type="xn",
         input_channels=8,
         hidden_dim=256,
         dropout=0.10,

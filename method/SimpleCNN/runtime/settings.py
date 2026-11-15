@@ -49,14 +49,18 @@ def _parse_dotenv(path: Path) -> dict[str, str]:
         if "=" not in line:
             raise ValueError(f"{path}:{line_number} 不是 KEY=VALUE 格式。")
         key, value = (part.strip() for part in line.split("=", maxsplit=1))
-        if not key.startswith("LT_"):
+        if not key.startswith("LT_") and key not in {
+            "WANDB_BASE_URL", "CUDA_VISIBLE_DEVICES", "ASCEND_RT_VISIBLE_DEVICES",
+            "LD_LIBRARY_PATH", "PYTHONNOUSERSITE", "MPLCONFIGDIR",
+            "HCCL_IF_BASE_PORT", "OMP_NUM_THREADS", "ASCEND_GLOBAL_LOG_LEVEL",
+        }:
             continue
         values[key] = _clean_env_value(value)
     return values
 
 
 def _read_env_file(path: Path | None) -> Path | None:
-    """将 .env 中未在进程环境中定义的 LT_* 值写入当前进程。"""
+    """加载本项目的运行时变量；已有进程环境变量优先。"""
     candidate = METHOD_ROOT / ".env" if path is None else path.expanduser().resolve()
     if not candidate.exists():
         if path is not None:

@@ -1,7 +1,4 @@
 {
-    // 使用 IntelliSense 了解相关属性。
-    // 悬停以查看现有属性的描述。
-    // 欲了解更多信息，请访问: https://go.microsoft.com/fwlink/?linkid=830387
     "version": "0.2.0",
     "configurations": [
         {
@@ -9,38 +6,50 @@
             "type": "debugpy",
             "request": "launch",
             "program": "${file}",
-            "console": "integratedTerminal"
+            "console": "integratedTerminal",
+            "envFile": "${workspaceFolder}/method/SimpleCNN/.env"
         },
         {
             "name": "SimpleCNN · CPU训练",
             "type": "debugpy",
             "request": "launch",
             "program": "${workspaceFolder}/method/SimpleCNN/train/train_ddp.py",
-            "args": ["--config", "debug", "--set", "wandb_mode=disabled"],
+            "args": [
+                "--config",
+                "debug",
+                "--set",
+                "wandb_mode=disabled"
+            ],
             "cwd": "${workspaceFolder}/method/SimpleCNN",
             "envFile": "${workspaceFolder}/method/SimpleCNN/.env",
+            "console": "integratedTerminal",
+            "justMyCode": false,
             "env": {
                 "LT_ACCELERATOR": "cpu",
-                "LT_AMP": "off"
-            },
-            "console": "integratedTerminal",
-            "justMyCode": false
+                "LT_DISTRIBUTED_BACKEND": "gloo",
+                "LT_AMP": "off",
+                "TORCH_DEVICE_BACKEND_AUTOLOAD": "0"
+            }
         },
         {
             "name": "SimpleCNN · 单卡训练 · debug",
             "type": "debugpy",
             "request": "launch",
             "program": "${workspaceFolder}/method/SimpleCNN/train/train_ddp.py",
-            "args": ["--config", "debug", "--set", "wandb_mode=disabled"],
+            "args": [
+                "--config",
+                "debug",
+                "--set",
+                "wandb_mode=disabled"
+            ],
             "cwd": "${workspaceFolder}/method/SimpleCNN",
             "envFile": "${workspaceFolder}/method/SimpleCNN/.env",
+            "console": "integratedTerminal",
+            "justMyCode": false,
             "env": {
-                "LT_ACCELERATOR": "auto",
                 "CUDA_VISIBLE_DEVICES": "0",
                 "ASCEND_RT_VISIBLE_DEVICES": "0"
-            },
-            "console": "integratedTerminal",
-            "justMyCode": false
+            }
         },
         {
             "name": "SimpleCNN · 多卡评估 · CUDA/NPU auto",
@@ -48,21 +57,17 @@
             "request": "launch",
             "module": "runtime.launch",
             "args": [
-                "eval/eval_ddp.py",
+                "eval/eval_ddp.py"
             ],
             "cwd": "${workspaceFolder}/method/SimpleCNN",
             "envFile": "${workspaceFolder}/method/SimpleCNN/.env",
-            "env": {
-                "LT_ACCELERATOR": "auto",
-                "CUDA_VISIBLE_DEVICES": "0,1,4,5",
-                "ASCEND_RT_VISIBLE_DEVICES": "6,7,8,9,12,13",
-                "HCCL_IF_BASE_PORT": "62000",
-                "OMP_NUM_THREADS": "1",
-                "ASCEND_GLOBAL_LOG_LEVEL": "3"
-            },
             "console": "integratedTerminal",
             "justMyCode": false,
-            "subProcess": false
+            "subProcess": false,
+            "env": {
+                "CUDA_VISIBLE_DEVICES": "0,1,4,5",
+                "ASCEND_RT_VISIBLE_DEVICES": "6,7,8,9,12,13"
+            }
         },
         {
             "name": "SimpleCNN · 多卡正式训练 · auto",
@@ -76,17 +81,13 @@
             ],
             "cwd": "${workspaceFolder}/method/SimpleCNN",
             "envFile": "${workspaceFolder}/method/SimpleCNN/.env",
-            "env": {
-                "LT_ACCELERATOR": "auto",
-                "CUDA_VISIBLE_DEVICES": "0,1,4,5",
-                "ASCEND_RT_VISIBLE_DEVICES": "2,3,4,5,6,7,8,9",
-                "HCCL_IF_BASE_PORT": "62000",
-                "OMP_NUM_THREADS": "1",
-                "ASCEND_GLOBAL_LOG_LEVEL": "3"
-            },
             "console": "integratedTerminal",
             "justMyCode": false,
-            "subProcess": false
+            "subProcess": false,
+            "env": {
+                "CUDA_VISIBLE_DEVICES": "0,1,4,5",
+                "ASCEND_RT_VISIBLE_DEVICES": "0,1,2,3"
+            }
         },
         {
             "name": "SimpleCNN · 单卡推理 · CUDA/NPU auto",
@@ -99,16 +100,13 @@
             ],
             "cwd": "${workspaceFolder}/method/SimpleCNN",
             "envFile": "${workspaceFolder}/method/SimpleCNN/.env",
-            "env": {
-                "LT_ACCELERATOR": "auto",
-                "CUDA_VISIBLE_DEVICES": "0",
-                "ASCEND_RT_VISIBLE_DEVICES": "0",
-                "OMP_NUM_THREADS": "1",
-                "ASCEND_GLOBAL_LOG_LEVEL": "3"
-            },
             "console": "integratedTerminal",
             "justMyCode": false,
-            "subProcess": false
+            "subProcess": false,
+            "env": {
+                "CUDA_VISIBLE_DEVICES": "0",
+                "ASCEND_RT_VISIBLE_DEVICES": "0"
+            }
         },
         {
             "name": "SimpleCNN · 单卡纯背景虚警评估 · CUDA/NPU auto",
@@ -122,16 +120,13 @@
             ],
             "cwd": "${workspaceFolder}/method/SimpleCNN",
             "envFile": "${workspaceFolder}/method/SimpleCNN/.env",
-            "env": {
-                "LT_ACCELERATOR": "auto",
-                "CUDA_VISIBLE_DEVICES": "0",
-                "ASCEND_RT_VISIBLE_DEVICES": "0",
-                "OMP_NUM_THREADS": "1",
-                "ASCEND_GLOBAL_LOG_LEVEL": "3"
-            },
             "console": "integratedTerminal",
             "justMyCode": false,
-            "subProcess": false
+            "subProcess": false,
+            "env": {
+                "CUDA_VISIBLE_DEVICES": "0",
+                "ASCEND_RT_VISIBLE_DEVICES": "0"
+            }
         },
         {
             "name": "SimpleCNN · 多 NPU 样本并行推理 · 全部可见 Chip",
@@ -144,16 +139,13 @@
             ],
             "cwd": "${workspaceFolder}/method/SimpleCNN",
             "envFile": "${workspaceFolder}/method/SimpleCNN/.env",
-            "env": {
-                "LT_ACCELERATOR": "npu",
-                "CUDA_VISIBLE_DEVICES": "0",
-                "ASCEND_RT_VISIBLE_DEVICES": "2,3,12,13,14,15",
-                "OMP_NUM_THREADS": "1",
-                "ASCEND_GLOBAL_LOG_LEVEL": "3"
-            },
             "console": "integratedTerminal",
             "justMyCode": false,
-            "subProcess": true
+            "subProcess": true,
+            "env": {
+                "CUDA_VISIBLE_DEVICES": "0",
+                "ASCEND_RT_VISIBLE_DEVICES": "2,3,12,13,14,15"
+            }
         },
         {
             "name": "SimpleCNN · 多 NPU 纯背景虚警评估 · 全部可见 Chip",
@@ -165,16 +157,13 @@
             ],
             "cwd": "${workspaceFolder}/method/SimpleCNN",
             "envFile": "${workspaceFolder}/method/SimpleCNN/.env",
-            "env": {
-                "LT_ACCELERATOR": "npu",
-                "CUDA_VISIBLE_DEVICES": "0",
-                "ASCEND_RT_VISIBLE_DEVICES": "2,3,6,7,8,9,12,13",
-                "OMP_NUM_THREADS": "1",
-                "ASCEND_GLOBAL_LOG_LEVEL": "3"
-            },
             "console": "integratedTerminal",
             "justMyCode": false,
-            "subProcess": false
+            "subProcess": false,
+            "env": {
+                "CUDA_VISIBLE_DEVICES": "0",
+                "ASCEND_RT_VISIBLE_DEVICES": "2,3,6,7,8,9,12,13"
+            }
         }
     ]
 }

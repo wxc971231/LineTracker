@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
-"""多进程批量生成含移动目标的 dataset1 风格二值时距数据。
+"""多进程批量生成 dataset1 风格二值时距数据，可选加入移动目标。
 
 本脚本的背景、目标、保存格式和预览图全部复用 generate_dataset1.py，唯一增加的
 参数是 --workers。每个进程独立生成一个样本目录，因此不会发生数据文件写入冲突。
+默认 --include-target false，生成用于虚警率评估的纯背景观测；
+使用 --include-target true 启用目标，并按目标合成参数控制强度和漏检。
 
 常用命令：
 
-    conda run -n linetracker-py311 python data/synthetic/generate_dataset1_parallel.py --samples 100 --workers 2 --random-knobs true --seed 20260717
+    python data/synthetic/generate_dataset1_parallel.py --samples 50000 --workers 32 --random-knobs true --seed 20260717 --include-target true
 
 建议先使用 --workers 2。单个样本会同时持有 300 x 300000 的背景、完整观测矩阵和
 绘图数据，盲目按 CPU 核数全开容易造成内存和磁盘写入争用。
@@ -65,6 +67,7 @@ def _generate_one(task: dict[str, Any]) -> dict[str, Any]:
         target_config=dict(task["target_config"]),
         preview_margin_m=float(task["preview_margin_m"]),
         preview_point_size=float(task["preview_point_size"]),
+        preview=bool(task["preview"]),
     )
 
 
@@ -106,6 +109,7 @@ def _build_tasks(
                 "target_config": target_config,
                 "preview_margin_m": args.preview_margin_m,
                 "preview_point_size": args.preview_point_size,
+                "preview": args.preview,
             }
         )
     return tasks
@@ -125,9 +129,7 @@ def build_parallel_parser() -> argparse.ArgumentParser:
         samples=1_000,
         workers=5,
         seed=20260816,
-        response_multiplier=0.0,
-        min_injection_probability=0.0,
-        max_injection_probability=0.0,
+        include_target=False,
     )
     return parser
 
@@ -189,7 +191,8 @@ def main(argv: Iterable[str] | None = None) -> None:
         json.dumps(_jsonable(manifest), ensure_ascii=False, indent=2) + "\n",
         encoding="utf-8",
     )
-    print(f"已并行生成 {len(records)} 个含目标二值样本目录：{args.output_dir}")
+    sample_kind = "含目标" if args.include_target else "纯背景"
+    print(f"已并行生成 {len(records)} 个{sample_kind}二值样本目录：{args.output_dir}")
     print(f"批次清单：{manifest_path}")
 
 

@@ -114,7 +114,7 @@ def build_generation_directory_name(args: argparse.Namespace) -> str:
             f"N{args.samples}",
             f"S{args.seed}",
             background_name,
-            f"T-{target_name}",
+            f"T-{target_name}" if args.include_target else "T-none",
         )
     )
 
@@ -867,6 +867,7 @@ def generate_sample(
     target_config: dict[str, float | int],
     preview_margin_m: float = DEFAULT_PREVIEW_MARGIN_M,
     preview_point_size: float = DEFAULT_PREVIEW_POINT_SIZE,
+    preview: bool = True,
 ) -> dict[str, Any]:
     """生成、保存一个含目标样本，并返回其轻量级清单记录。
 
@@ -878,6 +879,13 @@ def generate_sample(
 
     output_dir = Path(output_dir)
     target_config = dict(target_config)
+    if not target_config.get("enabled", True):
+        # 保留航迹字段与文件格式，但完全禁止目标注入，供虚警率评估。
+        target_config.update(
+            response_multiplier=0.0,
+            min_injection_probability=0.0,
+            max_injection_probability=0.0,
+        )
 
     # 先生成背景，再使用独立随机种子生成潜在航迹与目标注入事件。
     background, metadata = generate_background(
@@ -908,7 +916,7 @@ def generate_sample(
     )
     observation = overlay_target(background, target)
 
-    # 每个样本拥有独立目录，数据与对应三联检查图始终成对保存。
+    # 每个样本拥有独立目录，按需保存对应三联检查图。
     sample_dir = output_dir / f"{prefix}_{index:04d}"
     data_path = sample_dir / "data.npz"
     preview_path = sample_dir / "preview.png"
@@ -922,22 +930,23 @@ def generate_sample(
         },
     }
     save_packed_sample(data_path, background, observation, metadata, target)
-    save_sample_preview(
-        preview_path,
-        background,
-        observation,
-        np.asarray(metadata["target_probability_1m"], dtype=np.float64),
-        target,
-        margin_m=preview_margin_m,
-        point_size=preview_point_size,
-    )
+    if preview:
+        save_sample_preview(
+            preview_path,
+            background,
+            observation,
+            np.asarray(metadata["target_probability_1m"], dtype=np.float64),
+            target,
+            margin_m=preview_margin_m,
+            point_size=preview_point_size,
+        )
 
     # 清单只保留复现、统计和定位样本所需的轻量级信息。
     record: dict[str, Any] = {
         "index": index,
         "directory": sample_dir.name,
         "data_file": str(data_path.relative_to(output_dir)),
-        "preview_file": str(preview_path.relative_to(output_dir)),
+        "preview_file": str(preview_path.relative_to(output_dir)) if preview else None,
         "background_seed": background_seed,
         "target_seed": target_seed,
         "normalized_knobs": metadata["normalized_knobs"],
@@ -978,6 +987,7 @@ def generate_batch(
     target_config: dict[str, float | int],
     preview_margin_m: float = DEFAULT_PREVIEW_MARGIN_M,
     preview_point_size: float = DEFAULT_PREVIEW_POINT_SIZE,
+    preview: bool = True,
 ) -> list[dict[str, Any]]:
     """批量生成含目标的样本，并返回可写入清单的轻量级记录。
 
@@ -1023,6 +1033,7 @@ def generate_batch(
             target_config=target_config,
             preview_margin_m=preview_margin_m,
             preview_point_size=preview_point_size,
+            preview=preview,
         )
         records.append(record)
     return records
@@ -1055,8 +1066,13 @@ def build_parser() -> argparse.ArgumentParser:
         help="是否为每个样本额外计算并写入经验诊断量，批量较大时会较慢"
     )
 
+    parser.add_argument("--preview", type=_parse_bool, default=True, help="是否生成三联预览图；大批量生成可设为 false")
     parser.add_argument("--preview-margin-m", type=float, default=5_000.0, help="三联预览图在航迹两端保留的距离余量（m）")
     parser.add_argument("--preview-point-size", type=float, default=3.0, help="局部时距图中方形二值响应点的面积（pt²）")
+    parser.add_argument(
+        "--include-target", type=_parse_bool, default=True,
+        help="是否注入目标；false 生成纯背景观测，用于虚警率评估（仍保留潜在航迹真值字段）",
+    )
     target_group = parser.add_argument_group("目标合成参数")
     target_group.add_argument("--range-min-m", type=float, default=10_000.0, help="潜在轨迹允许的最小距离（m）")
     target_group.add_argument("--range-max-m", type=float, default=290_000.0, help="潜在轨迹允许的最大距离（m）")
@@ -1074,6 +1090,7 @@ def build_parser() -> argparse.ArgumentParser:
 def target_config_from_args(args: argparse.Namespace) -> dict[str, float | int]:
     """从两个生成入口共用的命令行参数中整理目标合成配置。"""
     return {
+        "enabled": args.include_target,
         "range_min_m": args.range_min_m,
         "range_max_m": args.range_max_m,
         "max_speed_mps": args.max_speed_mps,
@@ -1081,9 +1098,9 @@ def target_config_from_args(args: argparse.Namespace) -> dict[str, float | int]:
         "curve_strength": args.curve_strength,
         "smooth_window_frames": args.smooth_window_frames,
         "measurement_jitter_std_m": args.measurement_jitter_std_m,
-        "response_multiplier": args.response_multiplier,
-        "min_injection_probability": args.min_injection_probability,
-        "max_injection_probability": args.max_injection_probability,
+        "response_multiplier": args.response_multiplier if args.include_target else 0.0,
+        "min_injection_probability": args.min_injection_probability if args.include_target else 0.0,
+        "max_injection_probability": args.max_injection_probability if args.include_target else 0.0,
     }
 
 
@@ -1118,6 +1135,7 @@ def build_generation_hyperparameters(args: argparse.Namespace) -> dict[str, Any]
         },
         "target": target_config_from_args(args),
         "preview": {
+            "enabled": bool(args.preview),
             "margin_m": float(args.preview_margin_m),
             "background_point_size": float(args.preview_point_size),
         },
@@ -1153,6 +1171,7 @@ def main(argv: Iterable[str] | None = None) -> None:
         target_config=target_config,
         preview_margin_m=args.preview_margin_m,
         preview_point_size=args.preview_point_size,
+        preview=args.preview,
     )
     manifest_path = args.manifest or args.output_dir / "batch_manifest.json"
     manifest_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1171,7 +1190,8 @@ def main(argv: Iterable[str] | None = None) -> None:
         json.dumps(_jsonable(manifest), ensure_ascii=False, indent=2) + "\n",
         encoding="utf-8",
     )
-    print(f"已生成 {len(records)} 个含目标二值样本目录：{args.output_dir}")
+    sample_kind = "含目标" if args.include_target else "纯背景"
+    print(f"已生成 {len(records)} 个{sample_kind}二值样本目录：{args.output_dir}")
     print(f"批次清单：{manifest_path}")
 
 
